@@ -1,0 +1,29 @@
+{
+  "name": "@alexsun-top/opencode-turbo",
+  "version": "0.1.0",
+  "description": "Zero-config OpenCode plugin that recovers from provider stream errors, disconnects and rate limits by resuming the response where it was interrupted",
+  "type": "module",
+  "main": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "bunx tsc --noEmit",
+    "check": "bun run typecheck && bun run src/self-check.ts"
+  },
+  "keywords": [
+    "opencode",
+    "plugin",
+    "recovery",
+    "stream",
+    "retry",
+    "auto-continue"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "@opencode-ai/plugin": "^1.18.7",
+    "@opencode-ai/sdk": "^1.18.7",
+    "@types/node": "^25.5.2",
+    "typescript": "^5.9.3"
+  }
+}
