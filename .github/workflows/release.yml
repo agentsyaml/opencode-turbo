@@ -7,16 +7,19 @@ on:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    # OIDC trust must be configured for this environment (see npm docs):
+    #   npmjs.com → Access Tokens → "GitHub Actions OIDC" → environment: npm
+    #   GitHub → Settings → Environments → npm → OIDC issuer https://registry.npmjs.org
+    environment: npm
     permissions:
       contents: read
-      id-token: write # for npm provenance
+      id-token: write # token-free npm publish via OIDC (+ provenance)
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          registry-url: https://registry.npmjs.org
       - name: Verify tag matches package version
         run: |
           version=$(node -p "require('./package.json').version")
@@ -25,5 +28,3 @@ jobs:
       - run: bun run check
       - run: bun run build:tui
       - run: npm publish --provenance
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
