@@ -7,7 +7,7 @@ import { errorText, isRecoverable } from "./matcher"
 import { createNotifications } from "./notify"
 
 // ─────────────────────────────────────────────────────────────────────────────
-// @alexsun-top/opencode-turbo
+// opencode-turbo
 //
 // Zero-config recovery for provider errors opencode does not retry by default:
 //  - mid-stream closures ("provider closed the stream before sending a

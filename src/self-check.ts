@@ -1,4 +1,4 @@
-// Self-check for opencode-auto-recover matching logic.
+// Self-check for opencode-turbo matching logic.
 // Run with: bun run src/self-check.ts
 
 import { isRecoverable } from "./matcher.ts"

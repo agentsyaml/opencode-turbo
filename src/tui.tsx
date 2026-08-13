@@ -71,23 +71,6 @@ export function completionOf(message: MessageLike | undefined): { ms: number; at
   return { ms, at: new Date(completed).toLocaleTimeString() }
 }
 
-// ── Diagnostics ─────────────────────────────────────────────────────────────
-
-const TUI_LOG_PATH = [".local", "share", "opencode", "logs", "auto-recover.log"] as const
-
-async function tuiLog(message: string): Promise<void> {
-  try {
-    const { appendFile, mkdir } = await import("node:fs/promises")
-    const { homedir } = await import("node:os")
-    const { join } = await import("node:path")
-    const path = join(homedir(), ...TUI_LOG_PATH)
-    await mkdir(join(path, ".."), { recursive: true })
-    await appendFile(path, `[${new Date().toISOString()}] ${message}\n`, "utf-8")
-  } catch {
-    // diagnostics must never break the plugin
-  }
-}
-
 /** A text renderable captured via ref (native host object). */
 type TextRenderable = { content: string | number }
 
@@ -102,8 +85,6 @@ function StatusPanel(props: { api: TuiPluginApi; session_id: string }) {
   let lastThinking = ""
   let lastTool = ""
   let lastDone = ""
-  let lastDoneKey = ""
-  let diagCount = 0
   // Waiting-phase anchor: the waiting timer starts when the panel ENTERS the
   // waiting state — never from a message timestamp (a new user message can lag
   // the store sync, which used to make the wait accumulate from a stale value).
@@ -180,19 +161,6 @@ function StatusPanel(props: { api: TuiPluginApi; session_id: string }) {
     // only reliable "the turn is truly over" signal.
     const done = statusType === "idle" && assistantFinished && !newestIsUser ? completionOf(assistant) : undefined
 
-    // Diagnostic: log done transitions (appears/disappears) so a residual flash
-    // is observable without full-state spam.
-    const doneKey = done ? `done:${assistant?.id}:${done.ms}` : "no-done"
-    if (doneKey !== lastDoneKey) {
-      lastDoneKey = doneKey
-      if (diagCount < 20) {
-        diagCount += 1
-        void tuiLog(
-          `DONE ${doneKey} gen=${generating} status=${statusType ?? "?"} aId=${assistant?.id ?? "-"} ` +
-            `completed=${assistant?.time?.completed ?? "-"} finish=${assistant?.finish ?? "-"} newestUser=${newestIsUser}`,
-        )
-      }
-    }
     return {
       tool: tool ? { ...tool, elapsed: now - tool.start } : undefined,
       thinking,
@@ -208,9 +176,38 @@ function StatusPanel(props: { api: TuiPluginApi; session_id: string }) {
   // Only fires when at least one row's content changed. Rows are FIXED (no
   // layout jumping); the state maps to its row: thinking/waiting/idle on row 1,
   // tool on row 2, done on row 3.
-  const doSync = () => {
+  //
+  // Strict cadence: ROW_SWITCH_MS throttles transitions between active states
+  // (idle/thinking/waiting/tool/done) on EVERY render path (events, interval,
+  // refs all go through this gate). In-row updates (word count, durations)
+  // stay unthrottled — change detection keeps redundant repaints away.
+  const ROW_SWITCH_MS = 300
+  const TICK_MS = 100
+  let lastActiveRow = ""
+  let lastRowSwitchAt = 0
+
+  const sync = () => {
+    // compute() runs on the host's render path (ref callbacks run inside the
+    // reconciler's mount phase) — any throw must never take down the TUI.
     try {
       const { tool, thinking, thinkingElapsed, waiting, waitElapsed, working, done } = compute()
+      const activeRow = tool
+        ? "tool"
+        : thinking > 0
+          ? "thinking"
+          : working
+            ? "working"
+            : waiting
+              ? "waiting"
+              : done
+                ? "done"
+                : "idle"
+      if (activeRow !== lastActiveRow) {
+        if (Date.now() - lastRowSwitchAt < ROW_SWITCH_MS) return
+        lastActiveRow = activeRow
+        lastRowSwitchAt = Date.now()
+      }
+
       const thinkingSuffix = thinkingElapsed !== undefined ? ` · ${formatDuration(thinkingElapsed)}` : ""
       const waitSuffix = waitElapsed !== undefined ? ` · ${formatDuration(waitElapsed)}` : ""
       const nextRow1 = tool
@@ -243,50 +240,14 @@ function StatusPanel(props: { api: TuiPluginApi; session_id: string }) {
     }
   }
 
-  // Strict cadence: ROW_SWITCH_MS throttles transitions between active states
-  // (idle/thinking/waiting/tool/done) on EVERY render path (events, interval,
-  // refs all go through this gate). In-row updates (word count, durations)
-  // stay unthrottled — change detection keeps redundant repaints away.
-  const ROW_SWITCH_MS = 300
-  const TICK_MS = 100
-  let lastActiveRow = ""
-  let lastRowSwitchAt = 0
-
-  const renderIfNeeded = () => {
-    // compute() runs on the host's render path (ref callbacks run inside the
-    // reconciler's mount phase) — any throw must never take down the TUI.
-    try {
-      const { tool, thinking, waiting, working, done } = compute()
-      const activeRow = tool
-        ? "tool"
-        : thinking > 0
-          ? "thinking"
-          : working
-            ? "working"
-            : waiting
-              ? "waiting"
-              : done
-                ? "done"
-                : "idle"
-      if (activeRow !== lastActiveRow) {
-        if (Date.now() - lastRowSwitchAt < ROW_SWITCH_MS) return
-        lastActiveRow = activeRow
-        lastRowSwitchAt = Date.now()
-      }
-      doSync()
-    } catch {
-      // rendering must never break the plugin
-    }
-  }
-
   const theme = props.api.theme.current
 
   // Heartbeat: fine tick (in-row refresh) + session events (both gated above).
-  const timer = setInterval(renderIfNeeded, TICK_MS)
+  const timer = setInterval(sync, TICK_MS)
   timer.unref?.()
   const offs = [
-    props.api.event.on("message.part.updated", renderIfNeeded),
-    props.api.event.on("message.updated", renderIfNeeded),
+    props.api.event.on("message.part.updated", sync),
+    props.api.event.on("message.updated", sync),
   ]
   onCleanup(() => {
     for (const off of offs) off()
@@ -300,9 +261,9 @@ function StatusPanel(props: { api: TuiPluginApi; session_id: string }) {
         <text fg={theme.text}>
           <b>⚡ Status</b>
         </text>
-        <text ref={(ref: unknown) => { thinkingText = ref as TextRenderable; renderIfNeeded() }} fg={theme.textMuted} />
-        <text ref={(ref: unknown) => { toolText = ref as TextRenderable; renderIfNeeded() }} fg={theme.textMuted} />
-        <text ref={(ref: unknown) => { doneText = ref as TextRenderable; renderIfNeeded() }} fg={theme.textMuted} />
+        <text ref={(ref: unknown) => { thinkingText = ref as TextRenderable; sync() }} fg={theme.textMuted} />
+        <text ref={(ref: unknown) => { toolText = ref as TextRenderable; sync() }} fg={theme.textMuted} />
+        <text ref={(ref: unknown) => { doneText = ref as TextRenderable; sync() }} fg={theme.textMuted} />
       </box>
     </box>
   )
@@ -317,8 +278,6 @@ const tui: TuiPlugin = async (api) => {
       },
     },
   })
-
-  void tuiLog("TUI PLUGIN INIT + register done (imperative renderable)")
 }
 
 // File-based (path) plugins MUST export a non-empty `id` — the TUI runtime
