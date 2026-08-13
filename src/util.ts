@@ -1,8 +1,11 @@
 // Small shared helpers for opencode-turbo (server plugin, tui plugin, self-check).
 
-export function countWords(text: string): number {
-  const trimmed = text.trim()
-  return trimmed ? trimmed.split(/\s+/).length : 0
+export function estimateTokens(text: string): number {
+  // ponytail: chars/4 approximation for non-CJK text, 1 char = 1 token for CJK
+  // (cl100k-style heuristic). Exact per-model counts need a real tokenizer
+  // dependency — add when billing accuracy matters.
+  const cjk = (text.match(/[\u2e80-\u9fff\uf900-\ufaff\uff00-\uffef]/g) ?? []).length
+  return Math.round(cjk + (text.length - cjk) / 4)
 }
 
 export function formatDuration(ms: number): string {

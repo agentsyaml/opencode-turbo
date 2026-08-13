@@ -362,7 +362,13 @@ const plugin: Plugin = async ({ client }: PluginInput): Promise<Hooks> => {
   }
 
   const handleTerminalError = (sessionID: string, error: unknown) => {
-    if (!isRecoverable(error)) return
+    if (!isRecoverable(error)) {
+      // Log so permanently-ignored failures stay diagnosable (they would
+      // otherwise be invisible — the plugin only acts on recoverable ones).
+      const { name, message } = errorText(error)
+      if (message || name) void log(`NOT-RECOVERABLE ${sessionID}: ${name}: ${message}`)
+      return
+    }
     const state = getState(sessionID)
     if (!burstGate(state, error)) return
     const { name, message } = errorText(error)

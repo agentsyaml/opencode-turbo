@@ -67,6 +67,10 @@ const RETRY_PATTERNS = [
   "enotfound",
   "eai_again",
   "epipe",
+  // opencode's SQLite layer (transient lock contention, e.g. many concurrent
+  // instances writing the same session DB — a retry after backoff succeeds)
+  "failed to execute statement",
+  "database is locked",
 ]
 
 // HTTP status codes that are worth retrying even though opencode does not

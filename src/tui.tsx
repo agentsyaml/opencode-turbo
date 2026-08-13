@@ -1,21 +1,24 @@
-// TUI status panel for opencode-turbo.
+// TUI status line for opencode-turbo.
 //
-// Renders a persistent live-status panel into the sidebar via the
-// `sidebar_content` slot: thinking word count, the currently running tool with
-// elapsed time, and the last completed turn with duration + local timestamp.
+// Renders ONE persistent status line into the sidebar via the `sidebar_content`
+// slot, showing the current activity in priority order: running tool with
+// elapsed time, thinking token count, writing token count (working included),
+// waiting, and the last completed turn. One line only — the state never jumps
+// between rows.
 //
 // Update model (mirrors the working Tarquinen/oc-tps plugin): capture the
-// native text renderables via refs, MUTATE their `.content` directly on every
+// native text renderable via a ref, MUTATE its `.content` directly on every
 // state change, then call `api.renderer.requestRender()`. This bypasses solid
 // reactivity entirely — it works regardless of which solid instance the host
-// reconciler uses, because the renderable refs belong to the host renderer.
+// reconciler uses, because the renderable ref belongs to the host renderer.
 
 import type { TuiPlugin, TuiPluginApi, TuiPluginModule } from "@opencode-ai/plugin/tui"
 import { onCleanup } from "solid-js"
-import { countWords, formatDuration } from "./util"
+import { estimateTokens, formatDuration } from "./util"
 
 type PartLike = {
   id?: string
+  callID?: string
   type?: string
   text?: string
   tool?: string
@@ -45,22 +48,37 @@ export function lastAssistantOf(messages: MessageLike[] | undefined): MessageLik
   return undefined
 }
 
-/** Total word count of a message's reasoning parts. Pure, exported for self-check. */
-export function thinkingWordsOf(parts: PartLike[] | undefined): number {
+/** Estimated token count of a message's reasoning parts. Pure, exported for self-check. */
+export function thinkingTokensOf(parts: PartLike[] | undefined): number {
   const list = parts ?? []
   return list
     .filter((p) => p.type === "reasoning" && typeof p.text === "string")
-    .reduce((sum, p) => sum + countWords(p.text as string), 0)
+    .reduce((sum, p) => sum + estimateTokens(p.text as string), 0)
 }
 
-/** The currently running tool in a message's parts. Pure, exported for self-check. */
-export function runningToolOf(parts: PartLike[] | undefined): { name: string; start: number } | undefined {
+/** Estimated token count of a message's text parts. Pure, exported for self-check. */
+export function textTokensOf(parts: PartLike[] | undefined): number {
   const list = parts ?? []
-  const part = [...list].reverse().find((p) => p.type === "tool" && p.state?.status === "running")
+  return list
+    .filter((p) => p.type === "text" && typeof p.text === "string")
+    .reduce((sum, p) => sum + estimateTokens(p.text as string), 0)
+}
+
+/** The currently running or preparing tool. Pure, exported for self-check. */
+export function runningToolOf(parts: PartLike[] | undefined): { name: string; callID: string; start?: number } | undefined {
+  const list = parts ?? []
+  const part = [...list]
+    .reverse()
+    .find((p) => p.type === "tool" && (p.state?.status === "running" || p.state?.status === "pending"))
   if (!part) return undefined
-  const start = part.time?.ran ?? part.time?.created ?? part.state?.time?.start
-  if (!start) return undefined
-  return { name: part.state?.title ?? part.tool ?? part.name ?? "tool", start }
+  // NOTE: this build's TUI store carries tool time as {start} where `start` is
+  // updated on EVERY progress event — not a stable anchor. Prefer the schema's
+  // created/ran fields when present; otherwise the panel anchors on first sight.
+  return {
+    name: part.state?.title ?? part.tool ?? part.name ?? "tool",
+    callID: part.callID ?? part.id ?? "",
+    start: part.time?.ran ?? part.time?.created,
+  }
 }
 
 /** Completion info of an assistant message. Pure, exported for self-check. */
@@ -71,26 +89,58 @@ export function completionOf(message: MessageLike | undefined): { ms: number; at
   return { ms, at: new Date(completed).toLocaleTimeString() }
 }
 
+// ── Line mapping ────────────────────────────────────────────────────────────
+
+export interface PanelState {
+  tool?: { name: string; elapsed: number }
+  thinking: number
+  thinkingElapsed?: number
+  waiting: boolean
+  waitElapsed?: number
+  working: boolean
+  textTokens: number
+  done?: { ms: number; at: string }
+}
+
+/**
+ * One status line for the current state, in priority order:
+ * tool > thinking > writing (working included) > waiting > done > idle.
+ * Pure and exported so every display phase is command-verifiable.
+ */
+export function panelRow(state: PanelState): string {
+  const { tool, thinking, thinkingElapsed, waiting, waitElapsed, working, textTokens, done } = state
+  if (tool) return `🔧 ${tool.name} · ${formatDuration(tool.elapsed)}`
+  if (thinking > 0) {
+    const suffix = thinkingElapsed !== undefined ? ` · ${formatDuration(thinkingElapsed)}` : ""
+    return `🤔 Thinking · ${thinking.toLocaleString()} tokens${suffix}`
+  }
+  if (working) return `✍️ Writing · ${textTokens.toLocaleString()} tokens`
+  if (waiting) {
+    const suffix = waitElapsed !== undefined ? ` · ${formatDuration(waitElapsed)}` : ""
+    return `⏳ Waiting${suffix}`
+  }
+  if (done) return `✅ Done · ${formatDuration(done.ms)} · ${done.at}`
+  return "🤖 idle"
+}
+
 /** A text renderable captured via ref (native host object). */
 type TextRenderable = { content: string | number }
 
 function StatusPanel(props: { api: TuiPluginApi; session_id: string }) {
-  let thinkingText: TextRenderable | undefined
-  let toolText: TextRenderable | undefined
-  let doneText: TextRenderable | undefined
-
-  // Change detection: only repaint when the displayed content actually changed.
-  // The panel always renders the SAME three rows (fixed layout — no line
-  // jumping); only the text within each row changes.
-  let lastThinking = ""
-  let lastTool = ""
-  let lastDone = ""
+  let statusText: TextRenderable | undefined
+  let lastLine = ""
   // Waiting-phase anchor: the waiting timer starts when the panel ENTERS the
   // waiting state — never from a message timestamp (a new user message can lag
   // the store sync, which used to make the wait accumulate from a stale value).
   let lastWaitStart = 0
+  // Stable anchors for tool elapsed: the store's tool `time.start` updates on
+  // every progress event, so anchor elapsed to the FIRST time the panel sees
+  // each tool call active. ponytail: map grows one entry per tool call per
+  // panel — clear it if a long-lived session ever shows memory growth.
+  const toolAnchors = new Map<string, number>()
 
   const compute = () => {
+    const now = Date.now()
     const messages = props.api.state.session.messages(props.session_id) as unknown as MessageLike[] | undefined
     const list = messages ?? []
 
@@ -119,18 +169,29 @@ function StatusPanel(props: { api: TuiPluginApi; session_id: string }) {
     else if (statusType === "idle" || statusType === "retry") generating = false
     else generating = newestIsUser || (!!assistant && !assistantFinished)
 
-    const tool = generating ? runningToolOf(parts) : undefined
-    // Thinking only while the reasoning is still streaming. The reasoning part
-    // time is {start, end?} (v1 Part shape — some builds use created/completed,
-    // so tolerate both): the counter stops once `end`/`completed` is set or the
-    // message finishes.
+    const found = generating ? runningToolOf(parts) : undefined
+    let tool: PanelState["tool"]
+    if (found) {
+      let start = found.start
+      if (start === undefined) {
+        start = toolAnchors.get(found.callID)
+        if (start === undefined) {
+          start = now
+          toolAnchors.set(found.callID, start)
+        }
+      }
+      tool = { name: found.name, elapsed: now - start }
+    }
+
+    // Thinking only while the reasoning is still streaming. The counter stops
+    // once the reasoning part's end/completed is set or the message finishes.
     const reasoningActive =
       generating &&
       !assistantFinished &&
       (parts?.some(
         (p) => p.type === "reasoning" && p.time?.end === undefined && p.time?.completed === undefined,
       ) ?? false)
-    const thinking = reasoningActive ? thinkingWordsOf(parts) : 0
+    const thinking = reasoningActive ? thinkingTokensOf(parts) : 0
     const firstReasoning = parts?.find((p) => p.type === "reasoning")
     const reasoningStart = firstReasoning?.time?.start ?? firstReasoning?.time?.created
     const thinkingStart = typeof reasoningStart === "number" && reasoningStart > 0 ? reasoningStart : assistant?.time?.created
@@ -147,50 +208,45 @@ function StatusPanel(props: { api: TuiPluginApi; session_id: string }) {
     // Working = generating with output already, but between phases (tool prep,
     // next step) — never show idle while the model is actively working.
     const working = generating && !tool && thinking === 0 && !waiting
+    const textTokens = working ? textTokensOf(parts) : 0
 
-    // Waiting timer: anchored to the moment the waiting phase began. The phase
-    // anchor resets whenever waiting exits, so each waiting phase counts from
-    // ~0 and never accumulates across turns or sync lags.
-    const now = Date.now()
+    // Waiting timer anchored to phase entry; resets whenever waiting exits.
     if (waiting && lastWaitStart === 0) lastWaitStart = now
     if (!waiting) lastWaitStart = 0
     const waitElapsed = waiting && lastWaitStart > 0 ? now - lastWaitStart : undefined
     // Done ONLY when the session status is explicitly "idle" — a multi-step
     // turn sets the message's time.completed per segment (mid-turn!), so the
-    // message state alone can never prove the turn ended. The status is the
-    // only reliable "the turn is truly over" signal.
+    // message state alone can never prove the turn ended.
     const done = statusType === "idle" && assistantFinished && !newestIsUser ? completionOf(assistant) : undefined
 
     return {
-      tool: tool ? { ...tool, elapsed: now - tool.start } : undefined,
+      tool,
       thinking,
       thinkingElapsed: typeof thinkingStart === "number" && thinkingStart > 0 ? now - thinkingStart : undefined,
       waiting,
       waitElapsed,
       working,
+      textTokens,
       done,
     }
   }
 
-  // Mutate the native renderables, then request a repaint (oc-tps pattern).
-  // Only fires when at least one row's content changed. Rows are FIXED (no
-  // layout jumping); the state maps to its row: thinking/waiting/idle on row 1,
-  // tool on row 2, done on row 3.
-  //
-  // Strict cadence: ROW_SWITCH_MS throttles transitions between active states
-  // (idle/thinking/waiting/tool/done) on EVERY render path (events, interval,
-  // refs all go through this gate). In-row updates (word count, durations)
-  // stay unthrottled — change detection keeps redundant repaints away.
-  const ROW_SWITCH_MS = 300
+  // State settle: a state must persist for STATE_SETTLE_MS before it is shown;
+  // until then the previous line stays. This kills flicker through short-lived
+  // phases right after a tool completes (bash -> waiting -> thinking chains):
+  // only states that genuinely last get rendered. In-row updates (token counts,
+  // durations) still refresh on every tick via change detection.
+  const STATE_SETTLE_MS = 300
   const TICK_MS = 100
-  let lastActiveRow = ""
-  let lastRowSwitchAt = 0
+  let shownRow = ""
+  let candidateRow = ""
+  let candidateSince = 0
 
   const sync = () => {
     // compute() runs on the host's render path (ref callbacks run inside the
     // reconciler's mount phase) — any throw must never take down the TUI.
     try {
-      const { tool, thinking, thinkingElapsed, waiting, waitElapsed, working, done } = compute()
+      const { tool, thinking, thinkingElapsed, waiting, waitElapsed, working, textTokens, done } = compute()
       const activeRow = tool
         ? "tool"
         : thinking > 0
@@ -202,38 +258,20 @@ function StatusPanel(props: { api: TuiPluginApi; session_id: string }) {
               : done
                 ? "done"
                 : "idle"
-      if (activeRow !== lastActiveRow) {
-        if (Date.now() - lastRowSwitchAt < ROW_SWITCH_MS) return
-        lastActiveRow = activeRow
-        lastRowSwitchAt = Date.now()
+      const nowMs = Date.now()
+      if (activeRow !== candidateRow) {
+        candidateRow = activeRow
+        candidateSince = nowMs
       }
-
-      const thinkingSuffix = thinkingElapsed !== undefined ? ` · ${formatDuration(thinkingElapsed)}` : ""
-      const waitSuffix = waitElapsed !== undefined ? ` · ${formatDuration(waitElapsed)}` : ""
-      const nextRow1 = tool
-        ? ""
-        : thinking > 0
-          ? `🤔 Thinking · ${thinking.toLocaleString()} words${thinkingSuffix}`
-          : waiting
-            ? `⏳ Waiting${waitSuffix}`
-            : working
-              ? "⏳ Working"
-              : done
-                ? ""
-                : "🤖 idle"
-      const nextRow2 = tool ? `🔧 ${tool.name} · ${formatDuration(tool.elapsed)}` : ""
-      const nextRow3 = done ? `✅ Done · ${formatDuration(done.ms)} · ${done.at}` : ""
-
-      if (nextRow1 === lastThinking && nextRow2 === lastTool && nextRow3 === lastDone) {
-        return // nothing changed — no repaint
+      if (candidateRow !== shownRow && nowMs - candidateSince < STATE_SETTLE_MS) {
+        return // settling: keep showing the previous line until the new state persists
       }
-      lastThinking = nextRow1
-      lastTool = nextRow2
-      lastDone = nextRow3
+      shownRow = candidateRow
 
-      if (thinkingText) thinkingText.content = nextRow1
-      if (toolText) toolText.content = nextRow2
-      if (doneText) doneText.content = nextRow3
+      const next = panelRow({ tool, thinking, thinkingElapsed, waiting, waitElapsed, working, textTokens, done })
+      if (next === lastLine) return // nothing changed — no repaint
+      lastLine = next
+      if (statusText) statusText.content = next
       props.api.renderer.requestRender()
     } catch {
       // rendering must never break the plugin
@@ -257,14 +295,7 @@ function StatusPanel(props: { api: TuiPluginApi; session_id: string }) {
   return (
     // sidebar slot roots must be stable; a conditional root never mounts
     <box>
-      <box flexDirection="column" gap={1}>
-        <text fg={theme.text}>
-          <b>⚡ Status</b>
-        </text>
-        <text ref={(ref: unknown) => { thinkingText = ref as TextRenderable; sync() }} fg={theme.textMuted} />
-        <text ref={(ref: unknown) => { toolText = ref as TextRenderable; sync() }} fg={theme.textMuted} />
-        <text ref={(ref: unknown) => { doneText = ref as TextRenderable; sync() }} fg={theme.textMuted} />
-      </box>
+      <text ref={(ref: unknown) => { statusText = ref as TextRenderable; sync() }} fg={theme.textMuted} />
     </box>
   )
 }
