@@ -36,6 +36,37 @@ For local development, point at the source directly:
 
 No configuration. Restart opencode after changing config.
 
+> The TUI plugin is served from `dist/tui.js` (built). After editing `src/tui.tsx`,
+> rebuild with `bun run build:tui` — otherwise the sidebar panel silently won't load.
+
+## Live status notifications
+
+The plugin ships two parts, loaded from the same config entry:
+
+- a **server plugin** (`./server` → `src/index.ts`): error recovery + retry/recovery
+  toast notifications
+- a **TUI plugin** (`./tui` → `src/tui.tsx`): a persistent live-status panel
+  rendered into the sidebar via the `sidebar_content` slot
+
+### TUI status panel
+
+Always visible in the sidebar while the model works (subscribes to the server
+event stream, so it updates live as parts stream in):
+
+- **Thinking** — live word count while the model reasons
+  (`🤔 Thinking · 1,234 words`)
+- **Current tool** — the running tool + elapsed time (`🔧 bash · 12.5s`)
+- **Last completion** — duration + local timestamp of the last finished turn
+  (`✅ Done · 1m 30s · 14:30:22`)
+
+### Toast notifications (only for notice-style events)
+
+- **Retries** — when opencode itself retries (`⚠️ Retrying · attempt 2`),
+  and when this plugin auto-recovers (`🔄 Auto-recovering · attempt 1/10`)
+
+All display is display-only: it never affects session state and never
+interferes with opencode's own retry loop.
+
 ## How it works
 
 opencode wraps every provider call in its own retry policy. Retryable errors
@@ -73,8 +104,9 @@ tool results), a generic nudge prompt is sent so the model re-engages.
   completion
 - recovery is single-flight per session; duplicate trigger events
   (`session.error` + `message.updated` for the same failure) are deduplicated
-- retry events arriving right after the plugin's own abort are ignored
-  (abort grace window)
+  by error signature
+- opencode's own retry events are never acted on — the unbounded retry loop is
+  left untouched (only surfaced as a notification toast)
 - the plugin never writes into chat history beyond the recovery prompt, and
   logs to `~/.local/share/opencode/logs/auto-recover.log`
 

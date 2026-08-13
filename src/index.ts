@@ -3,6 +3,8 @@ import type { Event } from "@opencode-ai/sdk"
 import { appendFile, mkdir } from "node:fs/promises"
 import { homedir } from "node:os"
 import { dirname, join } from "node:path"
+import { errorText, isRecoverable } from "./matcher"
+import { createNotifications } from "./notify"
 
 // ─────────────────────────────────────────────────────────────────────────────
 // @alexsun-top/opencode-turbo
@@ -30,100 +32,12 @@ import { dirname, join } from "node:path"
 const MAX_ATTEMPTS = 10 // consecutive recoveries per session before giving up
 const BACKOFF_BASE_MS = 1_000 // exponential backoff: 2s, 4s, 8s, ... capped at 30min
 const BACKOFF_MAX_MS = 1_800_000 // 30 minutes
-const BURST_DEDUPE_MS = 300 // session.error + message.updated fire together for one failure
+const TRIGGER_DEDUPE_MS = 10_000 // same error signature within this window is one failure
+const RE_FETCH_WAIT_MS = 500 // re-read messages when the failure is not visible yet
 const SETTLE_MS = 200 // wait after abort before reading messages
 const REVERT_WAIT_MS = 500 // wait after revert before re-sending
 const TERMINAL_DELAY_MS = 500 // wait before acting on a terminal error so message finalizes
 const MAX_PARTIAL_CHARS = 12_000 // tail of partial output fed to the continuation prompt
-
-// Substring patterns (case-insensitive) matched against "Name: message".
-// Covers stream closures, connection drops and provider overload that opencode
-// may or may not classify as retryable on its own.
-const RETRY_PATTERNS = [
-  "completion marker",
-  "upstream connection",
-  "mid-stream",
-  "stream closed",
-  "stream ended",
-  "stream error",
-  "stream interrupted",
-  "unexpected end",
-  "premature close",
-  "connection reset",
-  "connection closed",
-  "connection lost",
-  "connection terminated",
-  "connection aborted",
-  "econnreset",
-  "econnrefused",
-  "econnaborted",
-  "socket hang up",
-  "socket closed",
-  "network error",
-  "reset by peer",
-  "broken pipe",
-  "upstream connect error",
-  "fetch failed",
-  "failed to fetch",
-  "request timed out",
-  "connection timed out",
-  "response timeout",
-  "idle timeout",
-  "sse read timed out",
-  "no data received",
-  "read timed out",
-  "overloaded",
-  "service unavailable",
-  "bad gateway",
-  "internal server error",
-  "server error",
-  "rate limit",
-  "usage limit",
-  "too many requests",
-  "quota exceeded",
-  "resource exhausted",
-  "try your request again",
-  "retry your request",
-  // Provider/model-output errors that a retry lets the model fix itself
-  "bad request",
-  "reasoning_opaque",
-  "prefill",
-  "expected string, received undefined",
-  "invalid diff",
-  "json parsing failed",
-  "invalid input for tool",
-  "tool_use ids were found without tool_result",
-  "tried to call unavailable tool",
-  "disconnected",
-  "etimedout",
-  "enotfound",
-  "eai_again",
-  "epipe",
-]
-
-// HTTP status codes that are worth retrying even though opencode does not
-// retry them by default (most 4xx are non-retryable in opencode's policy).
-// 401 (auth), 404 (not found) and 413 (payload too large) are excluded as
-// permanent failures.
-const RETRY_STATUS_CODES = [400, 402, 403, 405, 408, 409, 422, 429, 500, 502, 503, 504, 524, 529]
-
-// Never recover on these (user action or permanent failure).
-const EXCLUDE_PATTERNS = [
-  "MessageAbortedError",
-  "operation was aborted",
-  "unauthorized",
-  "invalid api key",
-  "authentication",
-  "not authenticated",
-  "MessageOutputLengthError",
-  "output length",
-  "context overflow",
-  "too large to compact",
-  "not found",
-  "does not exist",
-  "invalid request body",
-  "unsupported",
-]
 
 const CONTINUATION_TEMPLATE =
   "Your previous response was interrupted mid-stream by a provider error. " +
@@ -144,40 +58,6 @@ async function log(message: string): Promise<void> {
   } catch {
     // logging must never break the plugin
   }
-}
-
-// ── Pure matching logic (exported for self-check) ──────────────────────────
-
-export function errorText(error: unknown): { name: string; message: string; statusCode?: number } {
-  if (!error || typeof error !== "object") return { name: "", message: "" }
-  const e = error as Record<string, unknown>
-  const data = (typeof e.data === "object" && e.data !== null ? e.data : {}) as Record<string, unknown>
-  const name = typeof e.name === "string" ? e.name : ""
-  const message =
-    (typeof data.message === "string" ? data.message : null) ??
-    (typeof e.message === "string" ? e.message : "")
-  const statusCode =
-    typeof data.statusCode === "number"
-      ? data.statusCode
-      : typeof e.statusCode === "number"
-        ? e.statusCode
-        : undefined
-  return { name, message, statusCode }
-}
-
-/** Decide whether an error is worth recovering from (exported for self-check). */
-export function isRecoverable(error: unknown): boolean {
-  const { name, message, statusCode } = errorText(error)
-  const match = `${name}: ${message}`.toLowerCase()
-
-  for (const pattern of EXCLUDE_PATTERNS) {
-    if (match.includes(pattern.toLowerCase())) return false
-  }
-  if (statusCode !== undefined && RETRY_STATUS_CODES.includes(statusCode)) return true
-  for (const pattern of RETRY_PATTERNS) {
-    if (match.includes(pattern.toLowerCase())) return true
-  }
-  return false
 }
 
 // ── Structural message types (defensive, tolerant of SDK shape drift) ───────
@@ -213,7 +93,9 @@ type PromptPart = { type: "text"; text: string } | { type: "file"; mime: string;
 interface SessionState {
   recovering: boolean
   attempts: number
-  lastTriggerAt: number
+  lastErrorKey?: string
+  lastErrorTime: number
+  lastRecoveredMessageID?: string
   gaveUp: boolean
 }
 
@@ -222,7 +104,7 @@ interface SessionState {
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
 function createState(): SessionState {
-  return { recovering: false, attempts: 0, lastTriggerAt: 0, gaveUp: false }
+  return { recovering: false, attempts: 0, lastErrorTime: 0, gaveUp: false }
 }
 
 /** Concatenated text of an assistant message's text parts, or null. */
@@ -279,6 +161,8 @@ function toPromptPart(part: PartLike): PromptPart | null {
 
 const plugin: Plugin = async ({ client }: PluginInput): Promise<Hooks> => {
   const states = new Map<string, SessionState>()
+  const notify = createNotifications(client)
+  void log("PLUGIN LOADED — opencode-turbo ready (recovery + notifications)")
 
   const getState = (sessionID: string): SessionState => {
     let state = states.get(sessionID)
@@ -311,7 +195,9 @@ const plugin: Plugin = async ({ client }: PluginInput): Promise<Hooks> => {
         await log(`GIVING UP on ${sessionID} after ${MAX_ATTEMPTS} attempts (last: ${reason})`)
         return
       }
-      state.attempts = attempt
+      // The attempt counter is committed only when a continuation is actually
+      // sent, so aborted attempts (e.g. the failure not being visible yet) do
+      // not burn the budget.
       await log(`RECOVER ${sessionID} attempt ${attempt}/${MAX_ATTEMPTS} — ${reason}`)
 
       // 1. Stop any in-flight generation FIRST, before any sleep: a live
@@ -323,25 +209,56 @@ const plugin: Plugin = async ({ client }: PluginInput): Promise<Hooks> => {
         return undefined
       })
       if (abortRes?.error) {
-        await log(`RECOVER ${sessionID}: abort failed: ${String(abortRes.error)}`)
+        const { name, message } = errorText(abortRes.error)
+        await log(`RECOVER ${sessionID}: abort failed: ${name}: ${message}`)
       }
       await sleep(SETTLE_MS)
 
       if (attempt > 1) await sleep(backoff(attempt))
       if (opts.delay) await sleep(TERMINAL_DELAY_MS)
 
-      // 2. Read the conversation.
-      const res = await client.session.messages({ path: { id: sessionID } }).catch(() => ({ data: [] as MessageLike[] }))
-      const messages = (res.data ?? []) as MessageLike[]
+      // 2. Read the conversation. On an HTTP error the client resolves with
+      //    {error, data: undefined} instead of rejecting — log it, don't
+      //    pretend the session is empty.
+      const res = await client.session.messages({ path: { id: sessionID } }).catch(async (err) => {
+        await log(`RECOVER ${sessionID}: messages threw: ${err instanceof Error ? err.message : String(err)}`)
+        return undefined
+      })
+      if (res?.error) {
+        const { name, message } = errorText(res.error)
+        await log(`RECOVER ${sessionID}: messages failed: ${name}: ${message}`)
+        return
+      }
+      const messages = (res?.data ?? []) as MessageLike[]
       if (messages.length === 0) {
         await log(`RECOVER ${sessionID}: no messages, aborting recovery`)
         return
       }
 
-      // The failure we are recovering from. If nothing looks failed anymore
-      // (e.g. the response actually completed), back off without touching it.
-      const lastAssistant = failedAssistant(messages)
+      // The failure we are recovering from. The abort finalizes the failed
+      // message asynchronously, so a fetch racing the finalization may miss
+      // the error; re-read once before giving up.
+      let lastAssistant = failedAssistant(messages)
       if (!lastAssistant) {
+        await sleep(RE_FETCH_WAIT_MS)
+        const retry = await client.session.messages({ path: { id: sessionID } }).catch(async (err) => {
+          await log(`RECOVER ${sessionID}: re-fetch threw: ${err instanceof Error ? err.message : String(err)}`)
+          return undefined
+        })
+        if (retry?.error) {
+          // A transient re-fetch failure is not a genuine unrecoverable state —
+          // log it and back off WITHOUT burning an attempt.
+          const { name, message } = errorText(retry.error)
+          await log(`RECOVER ${sessionID}: re-fetch failed: ${name}: ${message}`)
+          return
+        }
+        lastAssistant = failedAssistant((retry?.data ?? []) as MessageLike[])
+      }
+      if (!lastAssistant) {
+        // Commit the attempt so a persistently un-recoverable failure (e.g. the
+        // error never lands on the message) still trips MAX_ATTEMPTS instead of
+        // looping the full recovery cycle every TRIGGER_DEDUPE_MS forever.
+        state.attempts = attempt
         await log(`RECOVER ${sessionID}: no interrupted message found, skipping recovery`)
         return
       }
@@ -367,10 +284,21 @@ const plugin: Plugin = async ({ client }: PluginInput): Promise<Hooks> => {
           return undefined
         })
       if (!revertRes || revertRes.error) {
-        await log(`RECOVER ${sessionID}: revert failed (${String(revertRes?.error ?? "request threw")}), abandoning recovery`)
+        const { name, message } = errorText(revertRes?.error)
+        await log(`RECOVER ${sessionID}: revert failed (${name}: ${message}), abandoning recovery`)
         return
       }
       await sleep(REVERT_WAIT_MS)
+
+      // Commit the attempt only now: the recovery is genuinely proceeding.
+      // Notify here too, so the toast fires only for recoveries that actually
+      // act (not for cycles that immediately bail). Also clear the dedupe key
+      // so a fresh failure of the same signature still triggers recovery.
+      state.attempts = attempt
+      notify.onRecoveryStart(sessionID, attempt, MAX_ATTEMPTS)
+      state.lastRecoveredMessageID = lastAssistant.info?.id
+      state.lastErrorKey = undefined
+      state.lastErrorTime = 0
 
       // 4. Re-send: continuation with partial content, the original user parts,
       //    or a generic nudge when nothing resendable is available (e.g. the
@@ -404,7 +332,8 @@ const plugin: Plugin = async ({ client }: PluginInput): Promise<Hooks> => {
           return undefined
         })
       if (promptRes?.error) {
-        await log(`RECOVER ${sessionID}: continuation prompt failed: ${String(promptRes.error)}`)
+        const { name, message } = errorText(promptRes.error)
+        await log(`RECOVER ${sessionID}: continuation prompt failed: ${name}: ${message}`)
       } else {
         await log(`RECOVER ${sessionID}: continuation prompt sent (attempt ${attempt})`)
       }
@@ -415,18 +344,27 @@ const plugin: Plugin = async ({ client }: PluginInput): Promise<Hooks> => {
     }
   }
 
-  /** Rate-limit duplicate triggers from the session.error + message.updated burst. */
-  function burstGate(state: SessionState): boolean {
+  /**
+   * Deduplicate trigger events for one failure. The same failure surfaces as
+   * session.error AND message.updated, and the message finalization can delay
+   * the second event past the abort window. Key on the error signature with a
+   * generous window; the key is cleared once a continuation is actually sent,
+   * so a fresh failure of the same kind still triggers.
+   */
+  function burstGate(state: SessionState, error: unknown): boolean {
+    const { name, message } = errorText(error)
+    const key = `${name}:${message}`
     const now = Date.now()
-    if (now - state.lastTriggerAt < BURST_DEDUPE_MS) return false
-    state.lastTriggerAt = now
+    if (state.lastErrorKey === key && now - state.lastErrorTime < TRIGGER_DEDUPE_MS) return false
+    state.lastErrorKey = key
+    state.lastErrorTime = now
     return true
   }
 
   const handleTerminalError = (sessionID: string, error: unknown) => {
     if (!isRecoverable(error)) return
     const state = getState(sessionID)
-    if (!burstGate(state)) return
+    if (!burstGate(state, error)) return
     const { name, message } = errorText(error)
     void recover(sessionID, message || name, { delay: true })
   }
@@ -435,9 +373,16 @@ const plugin: Plugin = async ({ client }: PluginInput): Promise<Hooks> => {
     event: async ({ event }: { event: Event }): Promise<void> => {
       try {
         switch (event.type) {
-          // NOTE: session.status retry events are deliberately ignored —
-          // opencode's own (unbounded, exponential-backoff) retry loop is
-          // left untouched. This plugin only acts on terminal failures.
+          // session.status retry events are never acted on — opencode's own
+          // (unbounded, exponential-backoff) retry loop is left untouched.
+          // They are only surfaced as a notification toast.
+          case "session.status": {
+            const props = event.properties as { sessionID: string; status: { type: string; attempt?: number; message?: string } }
+            if (props.status?.type === "retry" && typeof props.sessionID === "string") {
+              notify.onSessionStatusRetry(props.sessionID, props.status.attempt ?? 0, props.status.message ?? "")
+            }
+            return
+          }
 
           case "session.error": {
             const props = event.properties as { sessionID?: string; error?: unknown }
@@ -449,15 +394,26 @@ const plugin: Plugin = async ({ client }: PluginInput): Promise<Hooks> => {
             const info = (event.properties as { info?: MessageLike["info"] }).info
             if (!info?.sessionID || info.role !== "assistant") return
             if (info.error) {
+              // The original failure's delayed message.updated error can arrive
+              // after the recovery finished — never re-recover the message we
+              // just recovered FROM.
+              const state = getState(info.sessionID)
+              if (info.id && info.id === state.lastRecoveredMessageID) return
               handleTerminalError(info.sessionID, info.error)
             } else if (info.finish || info.time?.completed !== undefined) {
               // Successful completion: reset the attempt counter so a later
               // failure starts a fresh recovery chain. Never reset while a
-              // recovery is in flight (it may have reverted this message).
+              // recovery is in flight, and never reset on the message we just
+              // recovered FROM — its late completion event (fired after the
+              // abort finalized it) must not count as chain success.
               const state = getState(info.sessionID)
+              if (info.id && info.id === state.lastRecoveredMessageID) return
               if ((state.attempts > 0 || state.gaveUp) && !state.recovering) {
                 state.attempts = 0
                 state.gaveUp = false
+                state.lastRecoveredMessageID = undefined
+                state.lastErrorKey = undefined
+                state.lastErrorTime = 0
                 await log(`SUCCESS ${info.sessionID}: recovery chain completed, attempts reset`)
               }
             }
@@ -473,6 +429,9 @@ const plugin: Plugin = async ({ client }: PluginInput): Promise<Hooks> => {
       } catch (err) {
         await log(`event handler error: ${err instanceof Error ? err.message : String(err)}`)
       }
+    },
+    dispose: async () => {
+      notify.dispose()
     },
   }
 }

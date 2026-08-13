@@ -5,11 +5,14 @@
   "type": "module",
   "main": "./src/index.ts",
   "exports": {
-    ".": "./src/index.ts"
+    ".": "./src/index.ts",
+    "./server": "./src/index.ts",
+    "./tui": "./dist/tui.js"
   },
   "scripts": {
     "typecheck": "bunx tsc --noEmit",
-    "check": "bun run typecheck && bun run src/self-check.ts"
+    "check": "bun run typecheck && bun run src/self-check.ts",
+    "build:tui": "bun build src/tui.tsx --outdir dist --target=bun --external '@opencode-ai/*' --external 'solid-js' --external '@opentui/solid' --external '@opentui/solid/*' --external '@opentui/core' --external '@opentui/core-*'"
   },
   "keywords": [
     "opencode",
@@ -23,7 +26,9 @@
   "devDependencies": {
     "@opencode-ai/plugin": "^1.18.7",
     "@opencode-ai/sdk": "^1.18.7",
+    "@opentui/solid": "^0.5.1",
     "@types/node": "^25.5.2",
+    "solid-js": "^1.9.14",
     "typescript": "^5.9.3"
   }
 }
