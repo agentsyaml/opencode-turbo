@@ -28,6 +28,13 @@
     "auto-continue"
   ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/agentsyaml/opencode-turbo.git"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "devDependencies": {
     "@opencode-ai/plugin": "^1.18.7",
     "@opencode-ai/sdk": "^1.18.7",
