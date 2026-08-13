@@ -14,6 +14,7 @@
 
 import type { TuiPlugin, TuiPluginApi, TuiPluginModule } from "@opencode-ai/plugin/tui"
 import { onCleanup } from "solid-js"
+import { isAbortError } from "./matcher"
 import { estimateTokens, formatDuration } from "./util"
 
 type PartLike = {
@@ -23,7 +24,7 @@ type PartLike = {
   text?: string
   tool?: string
   name?: string
-  state?: { status?: string; title?: string; time?: { start?: number; end?: number } }
+  state?: { status?: string; title?: string; input?: unknown; time?: { start?: number; end?: number } }
   // Tolerates both the v1 Part shape (time.start/end) and v2 (created/ran/completed).
   time?: { start?: number; end?: number; created?: number; ran?: number; completed?: number }
 }
@@ -64,8 +65,29 @@ export function textTokensOf(parts: PartLike[] | undefined): number {
     .reduce((sum, p) => sum + estimateTokens(p.text as string), 0)
 }
 
+// Tools whose input is file content worth counting: edit/write/patch. Command
+// tools (bash, ...) get no token suffix — a command's token count is noise.
+// The content is what the model is writing into files.
+const CONTENT_TOOLS = new Set(["edit", "write", "patch"])
+
+/** Estimated tokens of a raw tool input. Pure, exported for self-check. */
+export function toolInputTokensOf(input: unknown): number | undefined {
+  if (input === undefined || input === null) return undefined
+  if (typeof input === "string") return input.length > 0 ? estimateTokens(input) : undefined
+  // Pending tools carry an empty object until the args arrive — no tokens yet.
+  const json = JSON.stringify(input)
+  if (json === undefined || json === "{}") return undefined
+  return estimateTokens(json)
+}
+
+/** Content tools only — command tools get no token count. Pure, exported for self-check. */
+export function contentToolTokens(tool: string | undefined, input: unknown): number | undefined {
+  if (!tool || !CONTENT_TOOLS.has(tool)) return undefined
+  return toolInputTokensOf(input)
+}
+
 /** The currently running or preparing tool. Pure, exported for self-check. */
-export function runningToolOf(parts: PartLike[] | undefined): { name: string; callID: string; start?: number } | undefined {
+export function runningToolOf(parts: PartLike[] | undefined): { name: string; callID: string; start?: number; tool?: string; input?: unknown } | undefined {
   const list = parts ?? []
   const part = [...list]
     .reverse()
@@ -78,6 +100,8 @@ export function runningToolOf(parts: PartLike[] | undefined): { name: string; ca
     name: part.state?.title ?? part.tool ?? part.name ?? "tool",
     callID: part.callID ?? part.id ?? "",
     start: part.time?.ran ?? part.time?.created,
+    tool: part.tool,
+    input: part.state?.input,
   }
 }
 
@@ -91,15 +115,22 @@ export function completionOf(message: MessageLike | undefined): { ms: number; at
 
 // ── Line mapping ────────────────────────────────────────────────────────────
 
+// Braille spinner frames for the Working state — a moving icon proves the
+// panel is alive, visually distinct from Waiting's static hourglass.
+const SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
 export interface PanelState {
-  tool?: { name: string; elapsed: number }
+  tool?: { name: string; elapsed: number; tokens?: number }
   thinking: number
   thinkingElapsed?: number
   waiting: boolean
   waitElapsed?: number
   working: boolean
+  workElapsed?: number
+  workingSpin?: number
   textTokens: number
   done?: { ms: number; at: string }
+  failed?: boolean
 }
 
 /**
@@ -108,18 +139,26 @@ export interface PanelState {
  * Pure and exported so every display phase is command-verifiable.
  */
 export function panelRow(state: PanelState): string {
-  const { tool, thinking, thinkingElapsed, waiting, waitElapsed, working, textTokens, done } = state
-  if (tool) return `🔧 ${tool.name} · ${formatDuration(tool.elapsed)}`
+  const { tool, thinking, thinkingElapsed, waiting, waitElapsed, working, workElapsed, workingSpin, textTokens, done, failed } = state
+  if (tool) {
+    const tokensSuffix = tool.tokens !== undefined ? ` · ${tool.tokens.toLocaleString()} tokens` : ""
+    return `🔧 ${tool.name} · ${formatDuration(tool.elapsed)}${tokensSuffix}`
+  }
   if (thinking > 0) {
     const suffix = thinkingElapsed !== undefined ? ` · ${formatDuration(thinkingElapsed)}` : ""
-    return `🤔 Thinking · ${thinking.toLocaleString()} tokens${suffix}`
+    return `🤔 Thinking${suffix} · ${thinking.toLocaleString()} tokens`
   }
-  if (working) return `✍️ Writing · ${textTokens.toLocaleString()} tokens`
+  if (working) {
+    const suffix = workElapsed !== undefined ? ` · ${formatDuration(workElapsed)}` : ""
+    const spin = SPINNER[(workingSpin ?? 0) % SPINNER.length]
+    return `${spin} Working${suffix} · ${textTokens.toLocaleString()} tokens`
+  }
   if (waiting) {
     const suffix = waitElapsed !== undefined ? ` · ${formatDuration(waitElapsed)}` : ""
     return `⏳ Waiting${suffix}`
   }
   if (done) return `✅ Done · ${formatDuration(done.ms)} · ${done.at}`
+  if (failed) return "❌ Failed"
   return "🤖 idle"
 }
 
@@ -128,16 +167,16 @@ type TextRenderable = { content: string | number }
 
 function StatusPanel(props: { api: TuiPluginApi; session_id: string }) {
   let statusText: TextRenderable | undefined
-  let lastLine = ""
   // Waiting-phase anchor: the waiting timer starts when the panel ENTERS the
   // waiting state — never from a message timestamp (a new user message can lag
   // the store sync, which used to make the wait accumulate from a stale value).
   let lastWaitStart = 0
+  let lastWorkStart = 0
   // Stable anchors for tool elapsed: the store's tool `time.start` updates on
   // every progress event, so anchor elapsed to the FIRST time the panel sees
   // each tool call active. ponytail: map grows one entry per tool call per
   // panel — clear it if a long-lived session ever shows memory growth.
-  const toolAnchors = new Map<string, number>()
+  const toolAnchors = new Map<string, { start: number; tokens?: number; inputRef?: unknown }>()
 
   const compute = () => {
     const now = Date.now()
@@ -172,15 +211,19 @@ function StatusPanel(props: { api: TuiPluginApi; session_id: string }) {
     const found = generating ? runningToolOf(parts) : undefined
     let tool: PanelState["tool"]
     if (found) {
-      let start = found.start
-      if (start === undefined) {
-        start = toolAnchors.get(found.callID)
-        if (start === undefined) {
-          start = now
-          toolAnchors.set(found.callID, start)
-        }
+      // Tokens are recomputed only when the input REFERENCE changes (pending {}
+      // -> running args), never per tick — stringifying a large edit input on
+      // every 100ms heartbeat would waste the render path.
+      let anchor = toolAnchors.get(found.callID)
+      const start = found.start ?? anchor?.start ?? now
+      if (anchor === undefined) {
+        anchor = { start, tokens: contentToolTokens(found.tool, found.input), inputRef: found.input }
+        toolAnchors.set(found.callID, anchor)
+      } else if (anchor.inputRef !== found.input) {
+        anchor.inputRef = found.input
+        anchor.tokens = contentToolTokens(found.tool, found.input)
       }
-      tool = { name: found.name, elapsed: now - start }
+      tool = { name: found.name, elapsed: now - start, tokens: anchor.tokens }
     }
 
     // Thinking only while the reasoning is still streaming. The counter stops
@@ -209,6 +252,12 @@ function StatusPanel(props: { api: TuiPluginApi; session_id: string }) {
     // next step) — never show idle while the model is actively working.
     const working = generating && !tool && thinking === 0 && !waiting
     const textTokens = working ? textTokensOf(parts) : 0
+    // Working elapsed anchored to phase entry (mirrors the waiting anchor).
+    if (working && lastWorkStart === 0) lastWorkStart = now
+    if (!working) lastWorkStart = 0
+    const workElapsed = working && lastWorkStart > 0 ? now - lastWorkStart : undefined
+    // Spinner frame: advances every 100ms while working.
+    const workingSpin = working ? Math.floor(now / 100) % SPINNER.length : 0
 
     // Waiting timer anchored to phase entry; resets whenever waiting exits.
     if (waiting && lastWaitStart === 0) lastWaitStart = now
@@ -218,6 +267,11 @@ function StatusPanel(props: { api: TuiPluginApi; session_id: string }) {
     // turn sets the message's time.completed per segment (mid-turn!), so the
     // message state alone can never prove the turn ended.
     const done = statusType === "idle" && assistantFinished && !newestIsUser ? completionOf(assistant) : undefined
+    // A terminally-failed turn (assistant error, session idle) must never look
+    // like a fresh idle session — the "quiet ≠ stuck" promise. User-initiated
+    // aborts (Esc / stop) finalize with MessageAbortedError and are NOT
+    // failures — a deliberate stop must not show "Failed".
+    const failed = statusType === "idle" && !!assistant?.error && !newestIsUser && !isAbortError(assistant.error)
 
     return {
       tool,
@@ -226,52 +280,64 @@ function StatusPanel(props: { api: TuiPluginApi; session_id: string }) {
       waiting,
       waitElapsed,
       working,
+      workElapsed,
+      workingSpin,
       textTokens,
       done,
+      failed,
     }
   }
 
-  // State settle: a state must persist for STATE_SETTLE_MS before it is shown;
-  // until then the previous line stays. This kills flicker through short-lived
-  // phases right after a tool completes (bash -> waiting -> thinking chains):
-  // only states that genuinely last get rendered. In-row updates (token counts,
-  // durations) still refresh on every tick via change detection.
-  const STATE_SETTLE_MS = 300
+  // Anti-flicker with liveness: a state must persist for SETTLE_MS before it
+  // replaces the shown one, so rapid sub-300ms transitions (waiting -> thinking
+  // -> working -> tool) never flash. While holding, the shown state's numbers
+  // keep ticking from the hold snapshot (elapsed grows, spinner rotates) — the
+  // line stays alive, never frozen.
+  const SETTLE_MS = 300
   const TICK_MS = 100
-  let shownRow = ""
-  let candidateRow = ""
-  let candidateSince = 0
+  let lastLine = ""
+  let held: PanelState | undefined
+  let heldSince = 0
+  let heldBase = { tool: 0, thinking: 0, work: 0, wait: 0 }
+
+  const kindOf = (s: PanelState): string =>
+    s.tool ? "tool" : s.thinking > 0 ? "thinking" : s.working ? "working" : s.waiting ? "waiting" : s.done ? "done" : s.failed ? "failed" : "idle"
 
   const sync = () => {
     // compute() runs on the host's render path (ref callbacks run inside the
     // reconciler's mount phase) — any throw must never take down the TUI.
     try {
-      const { tool, thinking, thinkingElapsed, waiting, waitElapsed, working, textTokens, done } = compute()
-      const activeRow = tool
-        ? "tool"
-        : thinking > 0
-          ? "thinking"
-          : working
-            ? "working"
-            : waiting
-              ? "waiting"
-              : done
-                ? "done"
-                : "idle"
+      const state = compute()
       const nowMs = Date.now()
-      if (activeRow !== candidateRow) {
-        candidateRow = activeRow
-        candidateSince = nowMs
+      const nextKind = kindOf(state)
+      const shownKind = held ? kindOf(held) : nextKind
+      let line: string
+      if (!held || nextKind === shownKind || nowMs - heldSince >= SETTLE_MS) {
+        held = state
+        heldSince = nowMs
+        heldBase = {
+          tool: state.tool?.elapsed ?? 0,
+          thinking: state.thinkingElapsed ?? 0,
+          work: state.workElapsed ?? 0,
+          wait: state.waitElapsed ?? 0,
+        }
+        line = panelRow(state)
+      } else {
+        // Hold: keep the shown state, refresh its time-derived fields.
+        const delta = nowMs - heldSince
+        const refreshed: PanelState = {
+          ...held,
+          tool: held.tool ? { ...held.tool, elapsed: heldBase.tool + delta } : undefined,
+          thinkingElapsed: held.thinkingElapsed !== undefined ? heldBase.thinking + delta : undefined,
+          workElapsed: held.workElapsed !== undefined ? heldBase.work + delta : undefined,
+          waitElapsed: held.waitElapsed !== undefined ? heldBase.wait + delta : undefined,
+          workingSpin: Math.floor(nowMs / 100) % SPINNER.length,
+        }
+        line = panelRow(refreshed)
       }
-      if (candidateRow !== shownRow && nowMs - candidateSince < STATE_SETTLE_MS) {
-        return // settling: keep showing the previous line until the new state persists
-      }
-      shownRow = candidateRow
-
-      const next = panelRow({ tool, thinking, thinkingElapsed, waiting, waitElapsed, working, textTokens, done })
-      if (next === lastLine) return // nothing changed — no repaint
-      lastLine = next
-      if (statusText) statusText.content = next
+      if (line === lastLine) return // nothing changed — no repaint
+      lastLine = line
+      if (statusText) statusText.content = line
       props.api.renderer.requestRender()
     } catch {
       // rendering must never break the plugin

@@ -4,6 +4,10 @@
   "description": "Zero-config OpenCode plugin that recovers from provider stream errors, disconnects and rate limits by resuming the response where it was interrupted",
   "type": "module",
   "main": "./src/index.ts",
+  "files": [
+    "src",
+    "dist"
+  ],
   "exports": {
     ".": "./src/index.ts",
     "./server": "./src/index.ts",
@@ -12,6 +16,7 @@
   "scripts": {
     "typecheck": "bunx tsc --noEmit",
     "check": "bun run typecheck && bun run src/self-check.ts",
+    "prepare": "bun run build:tui",
     "build:tui": "bun build src/tui.tsx --outdir dist --target=bun --external '@opencode-ai/*' --external 'solid-js' --external '@opentui/solid' --external '@opentui/solid/*' --external '@opentui/core' --external '@opentui/core-*'"
   },
   "keywords": [

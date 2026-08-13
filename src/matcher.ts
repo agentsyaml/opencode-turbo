@@ -128,3 +128,14 @@ export function isRecoverable(error: unknown): boolean {
   }
   return false
 }
+
+/** User-initiated aborts are deliberate stops, not failures. */
+export function isAbortError(error: unknown): boolean {
+  const { name, message } = errorText(error)
+  const match = `${name}: ${message}`.toLowerCase()
+  return (
+    match.includes("messageabortederror") ||
+    match.includes("aborterror") ||
+    match.includes("operation was aborted")
+  )
+}

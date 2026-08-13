@@ -97,6 +97,7 @@ interface SessionState {
   lastErrorTime: number
   lastRecoveredMessageID?: string
   gaveUp: boolean
+  pendingError?: string
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -185,7 +186,14 @@ const plugin: Plugin = async ({ client }: PluginInput): Promise<Hooks> => {
    */
   async function recover(sessionID: string, reason: string, opts: { delay?: boolean } = {}): Promise<void> {
     const state = getState(sessionID)
-    if (state.recovering || state.gaveUp) return
+    if (state.recovering) {
+      // Queue: a terminal failure arriving while a recovery is in flight must
+      // not be silently dropped — its trigger event was already consumed by
+      // burstGate. Replayed in `finally` once the in-flight recovery ends.
+      state.pendingError = reason
+      return
+    }
+    if (state.gaveUp) return
 
     state.recovering = true
     try {
@@ -341,6 +349,11 @@ const plugin: Plugin = async ({ client }: PluginInput): Promise<Hooks> => {
       await log(`RECOVER ${sessionID} failed: ${err instanceof Error ? err.message : String(err)}`)
     } finally {
       state.recovering = false
+      const pending = state.pendingError
+      if (pending) {
+        state.pendingError = undefined
+        void recover(sessionID, pending)
+      }
     }
   }
 
@@ -406,12 +419,16 @@ const plugin: Plugin = async ({ client }: PluginInput): Promise<Hooks> => {
               const state = getState(info.sessionID)
               if (info.id && info.id === state.lastRecoveredMessageID) return
               handleTerminalError(info.sessionID, info.error)
-            } else if (info.finish || info.time?.completed !== undefined) {
+            } else if (info.finish && info.finish !== "tool-calls" && info.finish !== "unknown") {
               // Successful completion: reset the attempt counter so a later
-              // failure starts a fresh recovery chain. Never reset while a
-              // recovery is in flight, and never reset on the message we just
-              // recovered FROM — its late completion event (fired after the
-              // abort finalized it) must not count as chain success.
+              // failure starts a fresh recovery chain. NOTE: neither `finish`
+              // alone nor `time.completed` proves a turn ended — multi-step
+              // turns set BOTH per segment mid-turn (finish:"tool-calls",
+              // completed stamped by cleanup). Only a TERMINAL finish reason
+              // (anything but "tool-calls"/"unknown") proves the message truly
+              // ended. Never reset while a recovery is in flight, and never
+              // reset on the message we just recovered FROM — its late
+              // completion event must not count as chain success.
               const state = getState(info.sessionID)
               if (info.id && info.id === state.lastRecoveredMessageID) return
               if ((state.attempts > 0 || state.gaveUp) && !state.recovering) {

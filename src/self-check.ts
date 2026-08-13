@@ -1,9 +1,9 @@
 // Self-check for opencode-turbo matching logic.
 // Run with: bun run src/self-check.ts
 
-import { isRecoverable } from "./matcher.ts"
+import { isAbortError, isRecoverable } from "./matcher.ts"
 import { estimateTokens, formatDuration } from "./util.ts"
-import { completionOf, lastAssistantOf, panelRow, runningToolOf, textTokensOf, thinkingTokensOf } from "./tui.tsx"
+import { completionOf, contentToolTokens, lastAssistantOf, panelRow, runningToolOf, textTokensOf, thinkingTokensOf, toolInputTokensOf } from "./tui.tsx"
 
 function expect(actual: boolean, expected: boolean, label: string): void {
   if (actual !== expected) {
@@ -55,6 +55,11 @@ expect(isRecoverable({ name: "UnknownError", data: { message: "some unrelated fa
 expect(isRecoverable({ name: "SqlError", data: { message: "Failed to execute statement" } }), true, "sqlite execute failure is recoverable")
 expect(isRecoverable({ name: "SqlError", data: { message: "database is locked" } }), true, "sqlite lock is recoverable")
 
+// User-initiated aborts are deliberate stops, not failures.
+expect(isAbortError({ name: "MessageAbortedError", data: { message: "operation was aborted" } }), true, "abort error is detected")
+expect(isAbortError({ name: "AbortError", message: "Aborted" }), true, "dom aborterror is detected")
+expect(isAbortError({ name: "UnknownError", data: { message: "provider closed the stream" } }), false, "non-abort error is not an abort")
+
 // Shared pure helpers.
 if (estimateTokens("12345678") !== 2) { console.error("FAIL: estimateTokens ascii"); process.exit(1) }
 if (estimateTokens("中文") !== 2) { console.error("FAIL: estimateTokens cjk"); process.exit(1) }
@@ -79,6 +84,14 @@ const unstable = runningToolOf([{ type: "tool", tool: "write", callID: "c2", sta
 if (unstable?.name !== "write" || unstable.callID !== "c2" || unstable.start !== undefined) { console.error("FAIL: runningToolOf unstable start"); process.exit(1) }
 if (runningToolOf([{ type: "tool", tool: "bash", state: { status: "completed" } }]) !== undefined) { console.error("FAIL: runningToolOf completed"); process.exit(1) }
 if (runningToolOf(undefined) !== undefined) { console.error("FAIL: runningToolOf empty"); process.exit(1) }
+const tok = runningToolOf([{ type: "tool", tool: "write", callID: "c3", state: { status: "running", input: "12345678" } }])
+if (tok?.tool !== "write" || tok.input !== "12345678") { console.error("FAIL: runningToolOf input passthrough"); process.exit(1) }
+if (toolInputTokensOf("12345678") !== 2) { console.error("FAIL: toolInputTokensOf"); process.exit(1) }
+if (toolInputTokensOf("") !== undefined) { console.error("FAIL: toolInputTokensOf empty"); process.exit(1) }
+if (toolInputTokensOf({}) !== undefined) { console.error("FAIL: toolInputTokensOf empty object"); process.exit(1) }
+if (contentToolTokens("bash", "echo hello world") !== undefined) { console.error("FAIL: contentToolTokens bash"); process.exit(1) }
+if (contentToolTokens("edit", "12345678") !== 2) { console.error("FAIL: contentToolTokens edit"); process.exit(1) }
+if (contentToolTokens(undefined, "12345678") !== undefined) { console.error("FAIL: contentToolTokens none"); process.exit(1) }
 const completion = completionOf({ id: "a1", type: "assistant", time: { created: 1000, completed: 4000 } })
 if (!completion || completion.ms !== 3000) { console.error("FAIL: completionOf"); process.exit(1) }
 if (completionOf({ id: "a1", type: "assistant", error: {}, time: { created: 1, completed: 2 } }) !== undefined) { console.error("FAIL: completionOf error"); process.exit(1) }
@@ -90,11 +103,39 @@ const base = { thinking: 0, waiting: false, working: false, textTokens: 0 }
 if (panelRow(base) !== "🤖 idle") { console.error("FAIL: panelRow idle"); process.exit(1) }
 if (panelRow({ ...base, waiting: true, waitElapsed: 1500 }) !== "⏳ Waiting · 1.5s") { console.error("FAIL: panelRow waiting"); process.exit(1) }
 if (panelRow({ ...base, thinking: 1234 }) !== "🤔 Thinking · 1,234 tokens") { console.error("FAIL: panelRow thinking"); process.exit(1) }
-if (panelRow({ ...base, thinking: 500, thinkingElapsed: 30_000 }) !== "🤔 Thinking · 500 tokens · 30.0s") { console.error("FAIL: panelRow thinking elapsed"); process.exit(1) }
-if (panelRow({ ...base, working: true, textTokens: 567 }) !== "✍️ Writing · 567 tokens") { console.error("FAIL: panelRow writing"); process.exit(1) }
-if (panelRow({ ...base, working: true }) !== "✍️ Writing · 0 tokens") { console.error("FAIL: panelRow working tokens"); process.exit(1) }
+if (panelRow({ ...base, thinking: 500, thinkingElapsed: 30_000 }) !== "🤔 Thinking · 30.0s · 500 tokens") { console.error("FAIL: panelRow thinking elapsed"); process.exit(1) }
+if (panelRow({ ...base, working: true, textTokens: 567, workElapsed: 3200, workingSpin: 0 }) !== "⠋ Working · 3.2s · 567 tokens") { console.error("FAIL: panelRow working"); process.exit(1) }
+if (panelRow({ ...base, working: true, workElapsed: 3200, workingSpin: 1 }) !== "⠙ Working · 3.2s · 0 tokens") { console.error("FAIL: panelRow working spin"); process.exit(1) }
 if (panelRow({ ...base, tool: { name: "bash", elapsed: 2500 }, thinking: 1234 }) !== "🔧 bash · 2.5s") { console.error("FAIL: panelRow tool priority"); process.exit(1) }
+if (panelRow({ ...base, tool: { name: "edit", elapsed: 2500, tokens: 567 }, thinking: 1234 }) !== "🔧 edit · 2.5s · 567 tokens") { console.error("FAIL: panelRow tool tokens"); process.exit(1) }
 if (panelRow({ ...base, done: { ms: 90_000, at: "14:30:22" } }) !== "✅ Done · 1m 30s · 14:30:22") { console.error("FAIL: panelRow done"); process.exit(1) }
-console.log("ok: panel line mapping (8 phases)")
+if (panelRow({ ...base, failed: true }) !== "❌ Failed") { console.error("FAIL: panelRow failed"); process.exit(1) }
+if (panelRow({ ...base, done: { ms: 90_000, at: "14:30:22" }, failed: true }) !== "✅ Done · 1m 30s · 14:30:22") { console.error("FAIL: panelRow done over failed"); process.exit(1) }
+console.log("ok: panel line mapping (11 phases)")
+
+// ── Extended coverage (mixed CJK/ASCII estimation, selection edge cases) ─────
+
+// estimateTokens: CJK chars count as one token each, non-CJK at ~4 chars each.
+if (estimateTokens("中文English") !== 4) { console.error("FAIL: estimateTokens mixed"); process.exit(1) }
+if (estimateTokens("你好世界") !== 4) { console.error("FAIL: estimateTokens cjk only"); process.exit(1) }
+if (estimateTokens("    ") !== 1) { console.error("FAIL: estimateTokens whitespace"); process.exit(1) }
+
+// thinkingTokensOf / textTokensOf with mixed content and multiple parts.
+if (thinkingTokensOf([{ type: "reasoning", text: "中文12345678" }]) !== 4) { console.error("FAIL: thinkingTokensOf mixed"); process.exit(1) }
+if (textTokensOf([{ type: "text", text: "abcd" }, { type: "text", text: "efgh" }]) !== 2) { console.error("FAIL: textTokensOf multiple"); process.exit(1) }
+if (textTokensOf([{ type: "text", text: "" }]) !== 0) { console.error("FAIL: textTokensOf empty part"); process.exit(1) }
+
+// lastAssistantOf: trailing user message does not hide the last assistant.
+if (lastAssistantOf([{ type: "user" }, { type: "assistant", id: "a3" }, { type: "user" }])?.id !== "a3") { console.error("FAIL: lastAssistantOf trailing user"); process.exit(1) }
+if (lastAssistantOf([]) !== undefined) { console.error("FAIL: lastAssistantOf empty list"); process.exit(1) }
+
+// panelRow: waiting without elapsed shows the bare phase.
+if (panelRow({ ...base, waiting: true }) !== "⏳ Waiting") { console.error("FAIL: panelRow waiting bare"); process.exit(1) }
+// panelRow: tool wins over every other state.
+if (panelRow({ ...base, tool: { name: "write", elapsed: 1200, tokens: 300 }, working: true, textTokens: 999, thinking: 500, done: { ms: 1000, at: "12:00:00" } }) !== "🔧 write · 1.2s · 300 tokens") { console.error("FAIL: panelRow tool over all"); process.exit(1) }
+// panelRow: failed wins over idle but not over done.
+if (panelRow({ ...base, failed: true }) !== "❌ Failed") { console.error("FAIL: panelRow failed priority"); process.exit(1) }
+
+console.log("ok: extended coverage (mixed content, edge cases)")
 
 console.log("all checks passed")
