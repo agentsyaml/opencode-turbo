@@ -7,9 +7,10 @@ on:
 jobs:
   publish:
     runs-on: ubuntu-latest
-    # OIDC trust must be configured for this environment (see npm docs):
-    #   npmjs.com → Access Tokens → "GitHub Actions OIDC" → environment: npm
-    #   GitHub → Settings → Environments → npm → OIDC issuer https://registry.npmjs.org
+    # Token-free publishing via npm Trusted Publishing (OIDC). Configure on
+    # npmjs.com → Packages → @alexsun-top/opencode-turbo → Settings → Trusted
+    # publishing → GitHub Actions: org "agentsyaml", repo "opencode-turbo",
+    # workflow "release.yml", environment "npm", allowed action "npm publish".
     environment: npm
     permissions:
       contents: read
@@ -20,6 +21,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+      - name: Upgrade npm for OIDC trusted publishing (>= 11.5.1)
+        run: npm install --global npm@12
       - name: Verify tag matches package version
         run: |
           version=$(node -p "require('./package.json').version")
