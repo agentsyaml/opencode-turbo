@@ -16,9 +16,9 @@ jobs:
       contents: read
       id-token: write # token-free npm publish via OIDC (+ provenance)
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: oven-sh/setup-bun@v2
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
       - name: Upgrade npm for OIDC trusted publishing (>= 11.5.1)
