@@ -80,6 +80,11 @@ if (textTokensOf([{ type: "reasoning", text: "ignored" }, { type: "tool", tool: 
 if (textTokensOf(undefined) !== 0) { console.error("FAIL: textTokensOf empty"); process.exit(1) }
 const tool = runningToolOf([{ type: "tool", tool: "bash", callID: "c1", state: { status: "running" }, time: { ran: 1000 } }])
 if (tool?.name !== "bash" || tool.callID !== "c1" || tool.start !== 1000) { console.error("FAIL: runningToolOf"); process.exit(1) }
+const timeoutTool = runningToolOf([{ type: "tool", tool: "bash", callID: "c8", state: { status: "running", input: { command: "ls", timeout: 30000 } } }])
+if (timeoutTool?.timeout !== 30000) { console.error("FAIL: runningToolOf timeout"); process.exit(1) }
+if (runningToolOf([{ type: "tool", tool: "bash", callID: "c9", state: { status: "running", input: { command: "ls" } } }])?.timeout !== undefined) { console.error("FAIL: runningToolOf no timeout"); process.exit(1) }
+if (runningToolOf([{ type: "tool", tool: "bash", callID: "c10", state: { status: "running", input: { command: "ls", timeout: 0 } } }])?.timeout !== undefined) { console.error("FAIL: runningToolOf zero timeout"); process.exit(1) }
+if (runningToolOf([{ type: "tool", tool: "bash", callID: "c11", state: { status: "running", input: "12345678" } }])?.timeout !== undefined) { console.error("FAIL: runningToolOf string input"); process.exit(1) }
 const unstable = runningToolOf([{ type: "tool", tool: "write", callID: "c2", state: { status: "pending" }, time: { start: 42 } }])
 if (unstable?.name !== "write" || unstable.callID !== "c2" || unstable.start !== undefined) { console.error("FAIL: runningToolOf unstable start"); process.exit(1) }
 if (runningToolOf([{ type: "tool", tool: "bash", state: { status: "completed" } }]) !== undefined) { console.error("FAIL: runningToolOf completed"); process.exit(1) }
@@ -107,7 +112,10 @@ if (panelRow({ ...base, thinking: 500, thinkingElapsed: 30_000 }) !== "🤔 Thin
 if (panelRow({ ...base, working: true, textTokens: 567, workElapsed: 3200, workingSpin: 0 }) !== "⠋ Working · 3.2s · 567 tokens") { console.error("FAIL: panelRow working"); process.exit(1) }
 if (panelRow({ ...base, working: true, workElapsed: 3200, workingSpin: 1 }) !== "⠙ Working · 3.2s · 0 tokens") { console.error("FAIL: panelRow working spin"); process.exit(1) }
 if (panelRow({ ...base, tool: { name: "bash", elapsed: 2500 }, thinking: 1234 }) !== "🔧 bash · 2.5s") { console.error("FAIL: panelRow tool priority"); process.exit(1) }
+if (panelRow({ ...base, tool: { name: "bash", elapsed: 2500, timeout: 30000 } }) !== "🔧 bash · 2.5s / 30s") { console.error("FAIL: panelRow tool timeout"); process.exit(1) }
+if (panelRow({ ...base, tool: { name: "bash", elapsed: 2500, timeout: 600000 } }) !== "🔧 bash · 2.5s / 10m 0s") { console.error("FAIL: panelRow tool timeout min"); process.exit(1) }
 if (panelRow({ ...base, tool: { name: "edit", elapsed: 2500, tokens: 567 }, thinking: 1234 }) !== "🔧 edit · 2.5s · 567 tokens") { console.error("FAIL: panelRow tool tokens"); process.exit(1) }
+if (panelRow({ ...base, tool: { name: "edit", elapsed: 2500, timeout: 30000, tokens: 567 } }) !== "🔧 edit · 2.5s / 30s · 567 tokens") { console.error("FAIL: panelRow tool timeout tokens"); process.exit(1) }
 if (panelRow({ ...base, done: { ms: 90_000, at: "14:30:22" } }) !== "✅ Done · 1m 30s · 14:30:22") { console.error("FAIL: panelRow done"); process.exit(1) }
 if (panelRow({ ...base, failed: true }) !== "❌ Failed") { console.error("FAIL: panelRow failed"); process.exit(1) }
 if (panelRow({ ...base, done: { ms: 90_000, at: "14:30:22" }, failed: true }) !== "✅ Done · 1m 30s · 14:30:22") { console.error("FAIL: panelRow done over failed"); process.exit(1) }

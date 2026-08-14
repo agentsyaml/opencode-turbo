@@ -87,12 +87,20 @@ export function contentToolTokens(tool: string | undefined, input: unknown): num
 }
 
 /** The currently running or preparing tool. Pure, exported for self-check. */
-export function runningToolOf(parts: PartLike[] | undefined): { name: string; callID: string; start?: number; tool?: string; input?: unknown } | undefined {
+export function runningToolOf(parts: PartLike[] | undefined): { name: string; callID: string; start?: number; tool?: string; input?: unknown; timeout?: number } | undefined {
   const list = parts ?? []
   const part = [...list]
     .reverse()
     .find((p) => p.type === "tool" && (p.state?.status === "running" || p.state?.status === "pending"))
   if (!part) return undefined
+  // The tool input carries the requested max timeout (ms) when the model set
+  // one; absent or 0 means "no explicit limit" — show nothing rather than "/ 0s".
+  const input = part.state?.input
+  const timeout =
+    typeof input === "object" && input !== null && typeof (input as { timeout?: unknown }).timeout === "number" &&
+    (input as { timeout: number }).timeout > 0
+      ? (input as { timeout: number }).timeout
+      : undefined
   // NOTE: this build's TUI store carries tool time as {start} where `start` is
   // updated on EVERY progress event — not a stable anchor. Prefer the schema's
   // created/ran fields when present; otherwise the panel anchors on first sight.
@@ -101,7 +109,8 @@ export function runningToolOf(parts: PartLike[] | undefined): { name: string; ca
     callID: part.callID ?? part.id ?? "",
     start: part.time?.ran ?? part.time?.created,
     tool: part.tool,
-    input: part.state?.input,
+    input,
+    timeout,
   }
 }
 
@@ -120,7 +129,7 @@ export function completionOf(message: MessageLike | undefined): { ms: number; at
 const SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
 export interface PanelState {
-  tool?: { name: string; elapsed: number; tokens?: number }
+  tool?: { name: string; elapsed: number; tokens?: number; timeout?: number }
   thinking: number
   thinkingElapsed?: number
   waiting: boolean
@@ -142,7 +151,9 @@ export function panelRow(state: PanelState): string {
   const { tool, thinking, thinkingElapsed, waiting, waitElapsed, working, workElapsed, workingSpin, textTokens, done, failed } = state
   if (tool) {
     const tokensSuffix = tool.tokens !== undefined ? ` · ${tool.tokens.toLocaleString()} tokens` : ""
-    return `🔧 ${tool.name} · ${formatDuration(tool.elapsed)}${tokensSuffix}`
+    // Whole-second limits read cleaner than "30.0s"; elapsed keeps its sub-second precision.
+    const timeoutSuffix = tool.timeout !== undefined ? ` / ${formatDuration(tool.timeout).replace(/\.0s$/, "s")}` : ""
+    return `🔧 ${tool.name} · ${formatDuration(tool.elapsed)}${timeoutSuffix}${tokensSuffix}`
   }
   if (thinking > 0) {
     const suffix = thinkingElapsed !== undefined ? ` · ${formatDuration(thinkingElapsed)}` : ""
@@ -223,7 +234,7 @@ function StatusPanel(props: { api: TuiPluginApi; session_id: string }) {
         anchor.inputRef = found.input
         anchor.tokens = contentToolTokens(found.tool, found.input)
       }
-      tool = { name: found.name, elapsed: now - start, tokens: anchor.tokens }
+      tool = { name: found.name, elapsed: now - start, tokens: anchor.tokens, timeout: found.timeout }
     }
 
     // Thinking only while the reasoning is still streaming. The counter stops

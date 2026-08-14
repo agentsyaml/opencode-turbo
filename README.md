@@ -44,8 +44,9 @@ touched. Logs: `~/.local/share/opencode/logs/auto-recover.log`.
 
 One status line in the sidebar, updating as parts stream in:
 
-- `🔧 bash · 12.5s` — the running tool with elapsed time; content tools also
-  show their input tokens: `🔧 edit · 2.5s · 567 tokens`
+- `🔧 bash · 12.5s` — the running tool with elapsed time; when the model set
+  an explicit timeout it shows the budget too: `🔧 bash · 12.5s / 30s`; content
+  tools also show their input tokens: `🔧 edit · 2.5s · 567 tokens`
 - `🤔 Thinking · 12.0s · 1,234 tokens` — elapsed time, then the estimated
   token count while reasoning
 - `⠋ Working · 3.2s · 567 tokens` — an animated spinner, the phase's elapsed
