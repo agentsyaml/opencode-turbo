@@ -34,6 +34,29 @@
 绝不干涉 OpenCode 自带的无界重试循环。
 日志：`~/.local/share/opencode/logs/auto-recover.log`。
 
+### 卡死看门狗
+
+静默流中断（TCP 存活、SSE 无数据）**不会产生任何错误**，因此 OpenCode
+既不重试也不超时——会话永远停在 thinking。看门狗把**生成期间的事件静默**
+当作卡死信号：
+
+- 任何生成进度事件（`message.part.updated`、`message.updated`、
+  `session.status`）都证明流是活的；`session.idle`/`session.error` 停止监控
+- 会话超过卡死阈值（默认 **30 分钟**）无任何事件 → 按失败恢复：中止 →
+  卡住的消息被标记为中断消息 → 以同一模型重发续写提示
+- 合法长推理不会被误判：推理流会持续产生事件，只有真正静默的会话才会触发
+
+阈值可通过插件选项配置：
+
+```json
+{
+  "plugin": [["@alexsun-top/opencode-turbo", { "stallTimeoutMs": 1800000 }]]
+}
+```
+
+（设为 `0` 可关闭看门狗。）恢复护栏与自动恢复一致——最多 10 次、指数退避、
+成功后计数归零。
+
 ### 实时状态行
 
 侧边栏常驻一行，随流式输出实时刷新：

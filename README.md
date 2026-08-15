@@ -40,6 +40,33 @@ user aborts, auth errors and permanent failures are never recovered; at most
 (counter resets on success); OpenCode's own unbounded retry loop is never
 touched. Logs: `~/.local/share/opencode/logs/auto-recover.log`.
 
+### Stall watchdog
+
+A silent stream stall — TCP alive, SSE silent — produces **no error**, so
+OpenCode never retries and never times out: the session hangs in thinking
+forever. The watchdog treats **event silence while generating** as the hang
+signal:
+
+- any generation-progress event (`message.part.updated`, `message.updated`,
+  `session.status`) proves the stream is alive; `session.idle`/`session.error`
+  stop the watch
+- a session that emits nothing for the stall timeout (default **30 minutes**)
+  is recovered like a failure: abort → the hung message finalizes as the
+  interrupted message → continuation prompt re-sent with the same model
+- legitimate long reasoning is never misjudged: reasoning streams keep
+  emitting parts, so only truly quiet sessions trigger
+
+Configure the timeout via plugin options:
+
+```json
+{
+  "plugin": [["@alexsun-top/opencode-turbo", { "stallTimeoutMs": 1800000 }]]
+}
+```
+
+(Set `0` to disable the watchdog.) The same recovery guardrails apply — at
+most 10 attempts with backoff, counter resets on success.
+
 ### Live status line
 
 One status line in the sidebar, updating as parts stream in:
@@ -83,6 +110,9 @@ Local development — point at the source:
 ```
 
 No configuration. Restart OpenCode after changing config.
+
+> The TUI status line is served from `dist/tui.js`. After editing `src/tui.tsx`,
+> run `bun run build:tui` — otherwise the sidebar line silently won't load.
 
 > The TUI status line is served from `dist/tui.js`. After editing `src/tui.tsx`,
 > run `bun run build:tui` — otherwise the sidebar line silently won't load.

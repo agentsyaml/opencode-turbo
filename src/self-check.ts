@@ -3,6 +3,7 @@
 
 import { isAbortError, isRecoverable } from "./matcher.ts"
 import { estimateTokens, formatDuration } from "./util.ts"
+import { stallCandidates, trackAction } from "./stall.ts"
 import { completionOf, contentToolTokens, lastAssistantOf, panelRow, runningToolOf, textTokensOf, thinkingTokensOf, toolInputTokensOf } from "./tui.tsx"
 
 function expect(actual: boolean, expected: boolean, label: string): void {
@@ -145,5 +146,45 @@ if (panelRow({ ...base, tool: { name: "write", elapsed: 1200, tokens: 300 }, wor
 if (panelRow({ ...base, failed: true }) !== "❌ Failed") { console.error("FAIL: panelRow failed priority"); process.exit(1) }
 
 console.log("ok: extended coverage (mixed content, edge cases)")
+
+// ── Stall watchdog (event-silence hang detection) ───────────────────────────
+
+// Generation-progress events prove liveness, tracked per session.
+{
+  const t = trackAction("message.part.updated", { part: { sessionID: "s1" } })
+  if (t.action !== "track" || t.sessionID !== "s1") { console.error("FAIL: trackAction part.updated"); process.exit(1) }
+}
+{
+  const t = trackAction("message.updated", { info: { sessionID: "s2" } })
+  if (t.action !== "track" || t.sessionID !== "s2") { console.error("FAIL: trackAction message.updated"); process.exit(1) }
+}
+{
+  const t = trackAction("session.status", { sessionID: "s3" })
+  if (t.action !== "track" || t.sessionID !== "s3") { console.error("FAIL: trackAction session.status"); process.exit(1) }
+}
+{
+  const t = trackAction("session.idle", { sessionID: "s4" })
+  if (t.action !== "clear" || t.sessionID !== "s4") { console.error("FAIL: trackAction session.idle"); process.exit(1) }
+}
+{
+  const t = trackAction("session.error", { sessionID: "s5" })
+  if (t.action !== "clear" || t.sessionID !== "s5") { console.error("FAIL: trackAction session.error"); process.exit(1) }
+}
+{
+  const t = trackAction("session.deleted", { info: { id: "s6" } })
+  if (t.action !== "clear" || t.sessionID !== "s6") { console.error("FAIL: trackAction session.deleted"); process.exit(1) }
+}
+if (trackAction("message.part.removed", {}).action !== "ignore") { console.error("FAIL: trackAction part.removed ignored"); process.exit(1) }
+if (trackAction("unknown.event", {}).action !== "ignore") { console.error("FAIL: trackAction unknown ignored"); process.exit(1) }
+if (trackAction("session.status", {}).action !== "ignore") { console.error("FAIL: trackAction missing sessionID"); process.exit(1) }
+
+// stallCandidates: only sessions quiet longer than the timeout qualify.
+const activity = new Map([["s1", 1_000_000], ["s2", 2_000_000], ["s3", 1_500_000]])
+if (JSON.stringify(stallCandidates(activity, 2_100_000, 600_000)) !== '["s1"]') { console.error("FAIL: stallCandidates basic"); process.exit(1) }
+if (stallCandidates(new Map(), 2_100_000, 600_000).length !== 0) { console.error("FAIL: stallCandidates empty"); process.exit(1) }
+// Exact boundary: now - last === timeout does NOT qualify (strictly greater).
+if (stallCandidates(new Map([["s1", 1_500_000]]), 2_100_000, 600_000).length !== 0) { console.error("FAIL: stallCandidates boundary"); process.exit(1) }
+
+console.log("ok: stall watchdog (trackAction, stallCandidates)")
 
 console.log("all checks passed")

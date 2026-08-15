@@ -1,10 +1,11 @@
-import type { Hooks, Plugin, PluginInput } from "@opencode-ai/plugin"
+import type { Hooks, Plugin, PluginInput, PluginOptions } from "@opencode-ai/plugin"
 import type { Event } from "@opencode-ai/sdk"
 import { appendFile, mkdir } from "node:fs/promises"
 import { homedir } from "node:os"
 import { dirname, join } from "node:path"
 import { errorText, isRecoverable } from "./matcher"
 import { createNotifications } from "./notify"
+import { stallCandidates, trackAction } from "./stall"
 
 // ─────────────────────────────────────────────────────────────────────────────
 // opencode-turbo
@@ -38,6 +39,11 @@ const SETTLE_MS = 200 // wait after abort before reading messages
 const REVERT_WAIT_MS = 500 // wait after revert before re-sending
 const TERMINAL_DELAY_MS = 500 // wait before acting on a terminal error so message finalizes
 const MAX_PARTIAL_CHARS = 12_000 // tail of partial output fed to the continuation prompt
+// Stall watchdog: a silent stream (TCP alive, SSE silent) never errors, so it
+// never reaches the recovery paths above. Event silence while generating is
+// the hang signal. Default 30min; override via plugin options stallTimeoutMs.
+const STALL_TIMEOUT_MS = 30 * 60_000
+const STALL_CHECK_MS = 30_000 // watchdog scan interval
 
 const CONTINUATION_TEMPLATE =
   "Your previous response was interrupted mid-stream by a provider error. " +
@@ -160,10 +166,14 @@ function toPromptPart(part: PartLike): PromptPart | null {
 
 // ── Plugin ──────────────────────────────────────────────────────────────────
 
-const plugin: Plugin = async ({ client }: PluginInput): Promise<Hooks> => {
+const plugin: Plugin = async ({ client }: PluginInput, options: PluginOptions = {}): Promise<Hooks> => {
   const states = new Map<string, SessionState>()
+  // Stall watchdog: sessionID -> last event timestamp. Only sessions that
+  // produced generation events are watched; idle/error/deleted clear them.
+  const activity = new Map<string, number>()
+  const stallTimeoutMs = typeof options.stallTimeoutMs === "number" ? options.stallTimeoutMs : STALL_TIMEOUT_MS
   const notify = createNotifications(client)
-  void log("PLUGIN LOADED — opencode-turbo ready (recovery + notifications)")
+  void log("PLUGIN LOADED — opencode-turbo ready (recovery + stall watchdog + notifications)")
 
   const getState = (sessionID: string): SessionState => {
     let state = states.get(sessionID)
@@ -388,9 +398,43 @@ const plugin: Plugin = async ({ client }: PluginInput): Promise<Hooks> => {
     void recover(sessionID, message || name, { delay: true })
   }
 
+  // Stall watchdog: scan the activity map; any watched session that went
+  // silent past the timeout is presumed hung and recovered like a failure.
+  // The recovery aborts the hung stream, which finalizes the message (error
+  // "Aborted" lands on it), so the normal recover() path picks it up as the
+  // interrupted assistant message and re-sends the continuation.
+  const stallTimer = stallTimeoutMs > 0
+    ? setInterval(() => {
+        const now = Date.now()
+        for (const id of stallCandidates(activity, now, stallTimeoutMs)) {
+          const state = getState(id)
+          if (state.gaveUp) {
+            activity.delete(id)
+            continue
+          }
+          const quietFor = Math.round((now - (activity.get(id) ?? now)) / 60_000)
+          // Re-arm BEFORE recovering: recovery itself may take a while, and the
+          // resumed generation resets the timestamp via new events anyway.
+          activity.set(id, now)
+          void recover(id, `STALL_TIMEOUT: no events for ~${quietFor}min`)
+        }
+      }, STALL_CHECK_MS)
+    : undefined
+  stallTimer?.unref?.()
+
   return {
     event: async ({ event }: { event: Event }): Promise<void> => {
       try {
+        // Stall watchdog bookkeeping first: any generation-progress event is
+        // liveness proof; terminal events stop the watch. Independent of the
+        // recovery switch below.
+        const track = trackAction(event.type, event.properties)
+        if (track.action === "track" && track.sessionID) {
+          activity.set(track.sessionID, Date.now())
+        } else if (track.action === "clear" && track.sessionID) {
+          activity.delete(track.sessionID)
+        }
+
         switch (event.type) {
           // session.status retry events are never acted on — opencode's own
           // (unbounded, exponential-backoff) retry loop is left untouched.
@@ -454,6 +498,7 @@ const plugin: Plugin = async ({ client }: PluginInput): Promise<Hooks> => {
       }
     },
     dispose: async () => {
+      if (stallTimer) clearInterval(stallTimer)
       notify.dispose()
     },
   }
