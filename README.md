@@ -37,6 +37,10 @@ a terminal failure:
   transient network failures worth retrying. Genuine cert problems (expired,
   self-signed, missing issuer) are permanent and burn attempts — the recovery
   guardrails (attempt cap + backoff) keep that bounded.
+- **Empty output** — a turn that finishes after thinking with nothing to show
+  (repetition loops, truncation) is a silent model-side failure: opencode sees
+  a successful completion, so no error ever fires. The plugin verifies the
+  finished message and re-sends the original request.
 
 Recovery per session: abort → capture the partial output → revert to the last
 user message → re-send a continuation prompt with the same model. Guardrails:

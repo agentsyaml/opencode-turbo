@@ -6,6 +6,7 @@ import { dirname, join } from "node:path"
 import { errorText, isRecoverable } from "./matcher"
 import { createNotifications } from "./notify"
 import { stallCandidates, trackAction } from "./stall"
+import { isEmptyOutput } from "./stall"
 
 // ─────────────────────────────────────────────────────────────────────────────
 // opencode-turbo
@@ -102,6 +103,7 @@ interface SessionState {
   lastErrorKey?: string
   lastErrorTime: number
   lastRecoveredMessageID?: string
+  lastEmptyCheckMessageID?: string
   gaveUp: boolean
   pendingError?: string
 }
@@ -138,6 +140,14 @@ function failedAssistant(messages: MessageLike[]): MessageLike | undefined {
   // completed response must never be treated as a failure.
   if (!last.info.finish && last.info.time?.completed === undefined) return last
   return undefined
+}
+
+/** Last assistant message for empty-output recovery: completed, no error. */
+function emptyOutputAssistant(messages: MessageLike[]): MessageLike | undefined {
+  const last = messages[messages.length - 1]
+  if (last?.info?.role !== "assistant") return undefined
+  if (last.info.error) return undefined
+  return last
 }
 
 function buildContinuation(partial: string): string {
@@ -194,7 +204,7 @@ const plugin: Plugin = async ({ client }: PluginInput, options: PluginOptions = 
    * partial assistant output, reverts to the last user message and re-sends a
    * continuation prompt with the same model.
    */
-  async function recover(sessionID: string, reason: string, opts: { delay?: boolean } = {}): Promise<void> {
+  async function recover(sessionID: string, reason: string, opts: { delay?: boolean; emptyOutput?: boolean } = {}): Promise<void> {
     const state = getState(sessionID)
     if (state.recovering) {
       // Queue: a terminal failure arriving while a recovery is in flight must
@@ -257,6 +267,7 @@ const plugin: Plugin = async ({ client }: PluginInput, options: PluginOptions = 
       // message asynchronously, so a fetch racing the finalization may miss
       // the error; re-read once before giving up.
       let lastAssistant = failedAssistant(messages)
+      if (!lastAssistant && opts.emptyOutput) lastAssistant = emptyOutputAssistant(messages)
       if (!lastAssistant) {
         await sleep(RE_FETCH_WAIT_MS)
         const retry = await client.session.messages({ path: { id: sessionID } }).catch(async (err) => {
@@ -271,6 +282,7 @@ const plugin: Plugin = async ({ client }: PluginInput, options: PluginOptions = 
           return
         }
         lastAssistant = failedAssistant((retry?.data ?? []) as MessageLike[])
+        if (!lastAssistant && opts.emptyOutput) lastAssistant = emptyOutputAssistant((retry?.data ?? []) as MessageLike[])
       }
       if (!lastAssistant) {
         // Commit the attempt so a persistently un-recoverable failure (e.g. the
@@ -398,6 +410,43 @@ const plugin: Plugin = async ({ client }: PluginInput, options: PluginOptions = 
     void recover(sessionID, message || name, { delay: true })
   }
 
+  /**
+   * Terminal-finish settlement. Reads the finished message from the store:
+   * empty output (thinking with nothing to show) is a silent model-side
+   * failure and goes through recovery WITHOUT resetting the chain; real
+   * output resets the chain as success. Deduped per message id by the caller.
+   */
+  async function settleFinished(sessionID: string, messageID: string): Promise<void> {
+    await sleep(TERMINAL_DELAY_MS) // let the message finalize before reading
+    const res = await client.session.messages({ path: { id: sessionID } }).catch(async (err) => {
+      await log(`SETTLE ${sessionID}: messages threw: ${err instanceof Error ? err.message : String(err)}`)
+      return undefined
+    })
+    if (res?.error) {
+      const { name, message } = errorText(res.error)
+      await log(`SETTLE ${sessionID}: messages failed: ${name}: ${message}`)
+      return
+    }
+    const messages = (res?.data ?? []) as MessageLike[]
+    const finished = messages.find((m) => m.info?.id === messageID)
+    if (finished && isEmptyOutput(finished)) {
+      const state = getState(sessionID)
+      if (state.recovering) return // recovery in flight; its own event will settle
+      void recover(sessionID, `EMPTY_OUTPUT: ${messageID} finished with no output`, { delay: true, emptyOutput: true })
+      return
+    }
+    // Real output (or message not found — nothing to verify): success path.
+    const state = getState(sessionID)
+    if ((state.attempts > 0 || state.gaveUp) && !state.recovering) {
+      state.attempts = 0
+      state.gaveUp = false
+      state.lastRecoveredMessageID = undefined
+      state.lastErrorKey = undefined
+      state.lastErrorTime = 0
+      await log(`SUCCESS ${sessionID}: recovery chain completed, attempts reset`)
+    }
+  }
+
   // Stall watchdog: scan the activity map; any watched session that went
   // silent past the timeout is presumed hung and recovered like a failure.
   // The recovery aborts the hung stream, which finalizes the message (error
@@ -464,18 +513,31 @@ const plugin: Plugin = async ({ client }: PluginInput, options: PluginOptions = 
               if (info.id && info.id === state.lastRecoveredMessageID) return
               handleTerminalError(info.sessionID, info.error)
             } else if (info.finish && info.finish !== "tool-calls" && info.finish !== "unknown") {
-              // Successful completion: reset the attempt counter so a later
-              // failure starts a fresh recovery chain. NOTE: neither `finish`
-              // alone nor `time.completed` proves a turn ended — multi-step
-              // turns set BOTH per segment mid-turn (finish:"tool-calls",
-              // completed stamped by cleanup). Only a TERMINAL finish reason
-              // (anything but "tool-calls"/"unknown") proves the message truly
-              // ended. Never reset while a recovery is in flight, and never
-              // reset on the message we just recovered FROM — its late
-              // completion event must not count as chain success.
+              // Terminal finish. Two mutually exclusive outcomes, decided
+              // asynchronously by reading the message store (the event carries
+              // no parts):
+              //   - empty output (thinking with nothing to show — repetition
+              //     loops, truncation): a silent model-side failure. Recover
+              //     WITHOUT resetting the chain — it is a failure, not success.
+              //   - real output: successful completion; reset the attempt
+              //     counter so a later failure starts a fresh chain.
+              // NOTE: neither `finish` alone nor `time.completed` proves a
+              // turn ended — multi-step turns set BOTH per segment mid-turn
+              // (finish:"tool-calls", completed stamped by cleanup). Only a
+              // TERMINAL finish reason (anything but "tool-calls"/"unknown")
+              // proves the message truly ended. Never reset while a recovery
+              // is in flight, and never reset on the message we just recovered
+              // FROM — its late completion event must not count as chain
+              // success.
               const state = getState(info.sessionID)
               if (info.id && info.id === state.lastRecoveredMessageID) return
-              if ((state.attempts > 0 || state.gaveUp) && !state.recovering) {
+              if (info.id && info.id === state.lastEmptyCheckMessageID) return
+              if (info.id) {
+                state.lastEmptyCheckMessageID = info.id
+                void settleFinished(info.sessionID, info.id)
+              } else if ((state.attempts > 0 || state.gaveUp) && !state.recovering) {
+                // No message id to verify against: fall back to the old
+                // success-only reset path (cannot tell empty from full).
                 state.attempts = 0
                 state.gaveUp = false
                 state.lastRecoveredMessageID = undefined

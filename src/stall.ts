@@ -55,3 +55,28 @@ export function stallCandidates(activity: ReadonlyMap<string, number>, now: numb
   }
   return stalled
 }
+
+// ── Empty-output detection ───────────────────────────────────────────────────
+
+interface EmptyMsg {
+  parts?: Array<{ type?: string; text?: string; synthetic?: boolean; ignored?: boolean }>
+}
+
+/**
+ * A completed assistant message that produced no output: no usable text part
+ * (reasoning parts don't count) and no tool call. Models occasionally finish
+ * after thinking with nothing to show (repetition loops, truncation) — the
+ * response is "successful" from opencode's view, so no error ever fires.
+ * Tool/agent parts count as output: the model is acting, not silent.
+ */
+export function isEmptyOutput(message: EmptyMsg | undefined): boolean {
+  if (!message?.parts) return true
+  let hasAction = false
+  for (const p of message.parts) {
+    const type = p.type
+    if (type === "tool" || type === "agent") hasAction = true
+    else if (type === "text" && typeof p.text === "string" && p.text.trim().length > 0 && !p.synthetic && !p.ignored) return false
+  }
+  return !hasAction
+}
+

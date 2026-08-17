@@ -3,7 +3,7 @@
 
 import { isAbortError, isRecoverable } from "./matcher.ts"
 import { estimateTokens, formatDuration } from "./util.ts"
-import { stallCandidates, trackAction } from "./stall.ts"
+import { isEmptyOutput, stallCandidates, trackAction } from "./stall.ts"
 import { completionOf, contentToolTokens, lastAssistantOf, panelRow, runningToolOf, textTokensOf, thinkingTokensOf, toolInputTokensOf } from "./tui.tsx"
 
 function expect(actual: boolean, expected: boolean, label: string): void {
@@ -194,5 +194,26 @@ if (stallCandidates(new Map(), 2_100_000, 600_000).length !== 0) { console.error
 if (stallCandidates(new Map([["s1", 1_500_000]]), 2_100_000, 600_000).length !== 0) { console.error("FAIL: stallCandidates boundary"); process.exit(1) }
 
 console.log("ok: stall watchdog (trackAction, stallCandidates)")
+
+// ── Empty-output detection (thinking with nothing to show) ───────────────────
+
+// Reasoning-only message: empty output, must be recovered.
+if (!isEmptyOutput({ parts: [{ type: "reasoning", text: "thinking..." }] })) { console.error("FAIL: isEmptyOutput reasoning only"); process.exit(1) }
+// No parts at all: empty.
+if (!isEmptyOutput({})) { console.error("FAIL: isEmptyOutput no parts"); process.exit(1) }
+// Real text: not empty.
+if (isEmptyOutput({ parts: [{ type: "reasoning", text: "thinking" }, { type: "text", text: "answer" }] })) { console.error("FAIL: isEmptyOutput with text"); process.exit(1) }
+// Tool call: not empty (the model is acting, not silent).
+if (isEmptyOutput({ parts: [{ type: "tool" }] })) { console.error("FAIL: isEmptyOutput with tool"); process.exit(1) }
+// Agent part: not empty (subagent is running / did work).
+if (isEmptyOutput({ parts: [{ type: "agent" }] })) { console.error("FAIL: isEmptyOutput with agent"); process.exit(1) }
+// Whitespace-only text: empty.
+if (!isEmptyOutput({ parts: [{ type: "text", text: "   " }] })) { console.error("FAIL: isEmptyOutput whitespace"); process.exit(1) }
+// Synthetic/ignored parts do not count as output.
+if (!isEmptyOutput({ parts: [{ type: "text", text: "x", synthetic: true }] })) { console.error("FAIL: isEmptyOutput synthetic"); process.exit(1) }
+// Empty message object with no parts.
+if (!isEmptyOutput(undefined)) { console.error("FAIL: isEmptyOutput undefined"); process.exit(1) }
+
+console.log("ok: empty-output detection (isEmptyOutput)")
 
 console.log("all checks passed")
