@@ -27,6 +27,10 @@
   `reasoning_opaque`、畸形工具调用）
 - 并发实例导致的 SQLite 瞬态错误（`Failed to execute statement`、
   `database is locked`）
+- TLS/证书类错误——Bun <1.4 会把握手期连接重置误报为
+  `UNKNOWN_CERTIFICATE_VERIFICATION_ERROR`（oven-sh/bun#31950），这类属于
+  值得重试的瞬态网络故障。真正的证书问题（过期、自签名、缺少签发者）是
+  永久性的，只会浪费恢复次数——由恢复护栏（次数上限 + 退避）兜住。
 
 恢复流程（按会话）：中止 → 捕获部分产出 → 回退到最后一条用户消息 →
 以同一模型重发续写提示。护栏：用户主动中止、鉴权错误及永久性失败永不恢复；

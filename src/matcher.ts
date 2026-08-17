@@ -71,6 +71,21 @@ const RETRY_PATTERNS = [
   // instances writing the same session DB — a retry after backoff succeeds)
   "failed to execute statement",
   "database is locked",
+  // TLS / certificate family. Genuine cert problems are permanent, but Bun
+  // (< 1.4) mislabels mid-handshake connection resets as UNKNOWN_CERTIFICATE_
+  // VERIFICATION_ERROR (oven-sh/bun#31950) — that case is a transient network
+  // failure and retrying is exactly right. Text cannot tell the two apart, so
+  // the recovery guardrails (attempt cap + backoff) do the filtering.
+  "certificate verification",
+  "unable to get local issuer certificate",
+  "unable to verify",
+  "self-signed",
+  "certificate has expired",
+  "certificate expired",
+  "ssl handshake",
+  "tls handshake",
+  "tls_error",
+  "ssl_error",
 ]
 
 // HTTP status codes that are worth retrying even though opencode does not

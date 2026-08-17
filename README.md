@@ -32,6 +32,11 @@ a terminal failure:
   `reasoning_opaque`, malformed tool calls)
 - transient SQLite errors (`Failed to execute statement`,
   `database is locked`) from concurrent OpenCode instances
+- TLS/certificate errors — Bun <1.4 mislabels mid-handshake connection resets
+  as `UNKNOWN_CERTIFICATE_VERIFICATION_ERROR` (oven-sh/bun#31950); those are
+  transient network failures worth retrying. Genuine cert problems (expired,
+  self-signed, missing issuer) are permanent and burn attempts — the recovery
+  guardrails (attempt cap + backoff) keep that bounded.
 
 Recovery per session: abort → capture the partial output → revert to the last
 user message → re-send a continuation prompt with the same model. Guardrails:

@@ -56,6 +56,14 @@ expect(isRecoverable({ name: "UnknownError", data: { message: "some unrelated fa
 expect(isRecoverable({ name: "SqlError", data: { message: "Failed to execute statement" } }), true, "sqlite execute failure is recoverable")
 expect(isRecoverable({ name: "SqlError", data: { message: "database is locked" } }), true, "sqlite lock is recoverable")
 
+// TLS / certificate family — Bun <1.4 mislabels mid-handshake resets as
+// certificate errors (oven-sh/bun#31950); those are transient and retryable.
+expect(isRecoverable({ name: "Error", data: { message: "unknown certificate verification error" } }), true, "bun certificate verification mislabel is recoverable")
+expect(isRecoverable({ name: "Error", message: "UNKNOWN_CERTIFICATE_VERIFICATION_ERROR: unknown certificate verification error" }), true, "certificate verification code is recoverable")
+expect(isRecoverable({ name: "Error", data: { message: "unable to get local issuer certificate" } }), true, "unable to get issuer is recoverable")
+expect(isRecoverable({ name: "Error", data: { message: "self-signed certificate in certificate chain" } }), true, "self-signed cert is recoverable")
+expect(isRecoverable({ name: "Error", data: { message: "SSL handshake failed: connection reset" } }), true, "ssl handshake failure is recoverable")
+
 // User-initiated aborts are deliberate stops, not failures.
 expect(isAbortError({ name: "MessageAbortedError", data: { message: "operation was aborted" } }), true, "abort error is detected")
 expect(isAbortError({ name: "AbortError", message: "Aborted" }), true, "dom aborterror is detected")
