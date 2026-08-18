@@ -6,6 +6,7 @@ import { dirname, join } from "node:path"
 import {
   BACKOFF_BASE_MS,
   BACKOFF_MAX_MS,
+  INTERNAL_ABORT_GRACE_MS,
   MAX_ATTEMPTS,
   RE_FETCH_WAIT_MS,
   SETTLE_MS,
@@ -14,6 +15,8 @@ import {
   buildContinuation,
   candidateAssistant,
   createState,
+  isBlockedSession,
+  matchesInternalAbort,
   partialText,
   sleep,
   targetAssistant,
@@ -68,7 +71,7 @@ const plugin: Plugin = async ({ client }: PluginInput, options: PluginOptions = 
     }
     for (const id of activity.keys()) if (paused.has(id)) activity.delete(id)
   }
-  const isBlocked = (sessionID: string) => paused.has(sessionID)
+  const isBlocked = (sessionID: string) => isBlockedSession(sessionID, paused, unknownParentPending)
   function noteActivity(sessionID: string, now: number): void {
     if (isBlocked(sessionID)) return
     activity.set(sessionID, now)
@@ -104,7 +107,15 @@ const plugin: Plugin = async ({ client }: PluginInput, options: PluginOptions = 
     pendingRequests.delete(sessionID); pendingWithoutID.delete(sessionID); pendingUser.delete(sessionID); unknownParentPending.delete(sessionID)
     refreshPauseState(); drainDeferredRecoveries()
   }
-  function isInternalAbort(sessionID: string, messageID?: string): boolean { const state = getState(sessionID); return state.internalAbortGeneration === state.recoveryGeneration && state.internalAbortGeneration !== undefined && (!messageID || messageID === state.internalAbortMessageID) }
+  function isInternalAbort(sessionID: string, messageID?: string): boolean { const state = getState(sessionID); return matchesInternalAbort(state.internalAbortGeneration, state.recoveryGeneration, state.internalAbortMessageID, messageID) }
+  function consumeInternalAbort(sessionID: string, messageID?: string): boolean { const state = getState(sessionID); if (!isInternalAbort(sessionID, messageID)) return false; state.internalAbortGeneration = undefined; state.internalAbortMessageID = undefined; return true }
+  function markInternalAbort(sessionID: string, generation: number, messageID: string): void {
+    const state = getState(sessionID)
+    state.internalAbortGeneration = generation
+    state.internalAbortMessageID = messageID
+    const timer = setTimeout(() => { if (state.recoveryGeneration === generation && state.internalAbortGeneration === generation && state.internalAbortMessageID === messageID) { state.internalAbortGeneration = undefined; state.internalAbortMessageID = undefined } }, INTERNAL_ABORT_GRACE_MS)
+    timer.unref?.()
+  }
   function cancelRecovery(sessionID: string): void {
     const state = getState(sessionID)
     state.recoveryGeneration++; state.internalAbortGeneration = undefined; state.internalAbortMessageID = undefined; state.pendingRecovery = undefined; state.lastRecoveredMessageID = undefined
@@ -237,11 +248,8 @@ const plugin: Plugin = async ({ client }: PluginInput, options: PluginOptions = 
         return
       }
       if (!opts.emptyOutput && !candidate.info?.error) {
-        state.internalAbortGeneration = generation
-        state.internalAbortMessageID = targetID
+        markInternalAbort(sessionID, generation, targetID)
         const abortRes = await client.session.abort({ path: { id: sessionID } }).catch(async (err) => { await log(`RECOVER ${sessionID}: abort threw: ${err instanceof Error ? err.message : String(err)}`); return undefined })
-        state.internalAbortGeneration = undefined
-        state.internalAbortMessageID = undefined
         if (cancelled()) return
         if (!abortRes || abortRes.error) {
           const { name, message } = errorText(abortRes?.error)
@@ -305,7 +313,7 @@ const plugin: Plugin = async ({ client }: PluginInput, options: PluginOptions = 
     } finally {
       state.recovering = false
       const pending = state.pendingRecovery
-      if (pending && !isBlocked(sessionID)) { state.pendingRecovery = undefined; void recover(sessionID, pending.reason, pending) }
+      if (!cancelled() && pending && !isBlocked(sessionID)) { state.pendingRecovery = undefined; void recover(sessionID, pending.reason, pending) }
     }
   }
   function drainDeferredRecoveries(): void {
@@ -410,7 +418,7 @@ const plugin: Plugin = async ({ client }: PluginInput, options: PluginOptions = 
           refreshPauseState(); drainDeferredRecoveries()
           if (event.type === "session.error") {
             const props = event.properties as { error?: unknown }
-            if ((props.error === undefined || isAbortError(props.error)) && !isInternalAbort(track.sessionID)) cancelRecovery(track.sessionID)
+            if ((props.error === undefined || isAbortError(props.error)) && !consumeInternalAbort(track.sessionID)) cancelRecovery(track.sessionID)
           }
         }
         switch (event.type) {
@@ -432,7 +440,7 @@ const plugin: Plugin = async ({ client }: PluginInput, options: PluginOptions = 
             const info = (event.properties as { info?: MessageLike["info"] }).info
             if (!info?.sessionID || info.role !== "assistant") return
             if (info.error) {
-              if (isAbortError(info.error)) { if (!isInternalAbort(info.sessionID, info.id)) cancelRecovery(info.sessionID); return }
+              if (isAbortError(info.error)) { if (!(info.id && consumeInternalAbort(info.sessionID, info.id))) cancelRecovery(info.sessionID); return }
               const state = getState(info.sessionID)
               if (info.id && info.id === state.lastRecoveredMessageID) return
               void handleTerminalError(info.sessionID, info.error, info.id)

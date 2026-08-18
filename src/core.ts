@@ -12,6 +12,7 @@ export const BACKOFF_MAX_MS = 1_800_000 // 30 minutes
 export const TRIGGER_DEDUPE_MS = 10_000 // same error signature within this window is one failure
 export const RE_FETCH_WAIT_MS = 500 // re-read messages when the failure is not visible yet
 export const SETTLE_MS = 200 // wait after abort before reading messages
+export const INTERNAL_ABORT_GRACE_MS = 10_000 // absorb late abort events without masking later user aborts
 export const TERMINAL_DELAY_MS = 500 // wait before acting on a terminal error so message finalizes
 export const MAX_PARTIAL_CHARS = 12_000 // tail of partial output fed to the continuation prompt
 
@@ -76,6 +77,14 @@ export const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve
 
 export function createState(): SessionState {
   return { recovering: false, recoveryGeneration: 0, attempts: 0, lastErrorTime: 0, gaveUp: false }
+}
+
+export function isBlockedSession(sessionID: string, paused: ReadonlySet<string>, unknownParentPending: ReadonlySet<string>): boolean {
+  return paused.has(sessionID) || unknownParentPending.has(sessionID)
+}
+
+export function matchesInternalAbort(markerGeneration: number | undefined, recoveryGeneration: number, markerMessageID: string | undefined, messageID?: string): boolean {
+  return markerGeneration === recoveryGeneration && markerGeneration !== undefined && (messageID === undefined || messageID === markerMessageID)
 }
 
 /** Concatenated text of an assistant message's text parts, or null. */

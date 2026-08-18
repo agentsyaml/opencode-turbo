@@ -2,6 +2,7 @@
 // Run with: bun run src/self-check.ts
 
 import { isAbortError, isRecoverable } from "./matcher.ts"
+import { isBlockedSession, matchesInternalAbort } from "./core.ts"
 import { estimateTokens, formatDuration } from "./util.ts"
 import { idleAction, isActiveStatus, isEmptyOutput, stallCandidates, trackAction } from "./stall.ts"
 import { completionOf, contentToolTokens, hasPendingUserRequest, lastAssistantOf, panelRow, runningToolOf, textTokensOf, thinkingTokensOf, toolInputTokensOf } from "./tui.tsx"
@@ -70,6 +71,11 @@ expect(isRecoverable({ name: "Error", data: { message: "SSL handshake failed: co
 expect(isAbortError({ name: "MessageAbortedError", data: { message: "operation was aborted" } }), true, "abort error is detected")
 expect(isAbortError({ name: "AbortError", message: "Aborted" }), true, "dom aborterror is detected")
 expect(isAbortError({ name: "UnknownError", data: { message: "provider closed the stream" } }), false, "non-abort error is not an abort")
+
+expect(matchesInternalAbort(3, 3, "m1", "m1"), true, "matching internal abort marker is recognized")
+expect(matchesInternalAbort(3, 3, "m1", "m2"), false, "different abort message does not match")
+expect(isBlockedSession("child", new Set(), new Set(["child"])), true, "unknown parent pending blocks its session")
+expect(isBlockedSession("other", new Set(), new Set(["child"])), false, "unknown parent pending stays local")
 
 // Shared pure helpers.
 if (estimateTokens("12345678") !== 2) { console.error("FAIL: estimateTokens ascii"); process.exit(1) }
