@@ -49,6 +49,11 @@ export function lastAssistantOf(messages: MessageLike[] | undefined): MessageLik
   return undefined
 }
 
+/** Whether the session has a permission or question request awaiting input. */
+export function hasPendingUserRequest(permission: ReadonlyArray<unknown> | undefined, question: ReadonlyArray<unknown> | undefined): boolean {
+  return (permission?.length ?? 0) > 0 || (question?.length ?? 0) > 0
+}
+
 /** Estimated token count of a message's reasoning parts. Pure, exported for self-check. */
 export function thinkingTokensOf(parts: PartLike[] | undefined): number {
   const list = parts ?? []
@@ -193,6 +198,10 @@ function StatusPanel(props: { api: TuiPluginApi; session_id: string }) {
     const now = Date.now()
     const messages = props.api.state.session.messages(props.session_id) as unknown as MessageLike[] | undefined
     const list = messages ?? []
+    const pendingUser = hasPendingUserRequest(
+      props.api.state.session.permission(props.session_id),
+      props.api.state.session.question(props.session_id),
+    )
 
     // The store's message list ordering is not guaranteed; derive recency from
     // time.created instead (order-independent).
@@ -219,7 +228,7 @@ function StatusPanel(props: { api: TuiPluginApi; session_id: string }) {
     else if (statusType === "idle" || statusType === "retry") generating = false
     else generating = newestIsUser || (!!assistant && !assistantFinished)
 
-    const found = generating ? runningToolOf(parts) : undefined
+    const found = !pendingUser && generating ? runningToolOf(parts) : undefined
     let tool: PanelState["tool"]
     if (found) {
       // Tokens are recomputed only when the input REFERENCE changes (pending {}
@@ -240,6 +249,7 @@ function StatusPanel(props: { api: TuiPluginApi; session_id: string }) {
     // Thinking only while the reasoning is still streaming. The counter stops
     // once the reasoning part's end/completed is set or the message finishes.
     const reasoningActive =
+      !pendingUser &&
       generating &&
       !assistantFinished &&
       (parts?.some(
@@ -258,10 +268,10 @@ function StatusPanel(props: { api: TuiPluginApi; session_id: string }) {
         p.type === "tool" ||
         (p.type === "text" && (p.text ?? "").trim().length > 0),
       ) ?? false)
-    const waiting = generating && !hasOutput
+    const waiting = pendingUser || (generating && !hasOutput)
     // Working = generating with output already, but between phases (tool prep,
     // next step) — never show idle while the model is actively working.
-    const working = generating && !tool && thinking === 0 && !waiting
+    const working = !pendingUser && generating && !tool && thinking === 0 && !waiting
     const textTokens = working ? textTokensOf(parts) : 0
     // Working elapsed anchored to phase entry (mirrors the waiting anchor).
     if (working && lastWorkStart === 0) lastWorkStart = now
@@ -277,12 +287,12 @@ function StatusPanel(props: { api: TuiPluginApi; session_id: string }) {
     // Done ONLY when the session status is explicitly "idle" — a multi-step
     // turn sets the message's time.completed per segment (mid-turn!), so the
     // message state alone can never prove the turn ended.
-    const done = statusType === "idle" && assistantFinished && !newestIsUser ? completionOf(assistant) : undefined
+    const done = !pendingUser && statusType === "idle" && assistantFinished && !newestIsUser ? completionOf(assistant) : undefined
     // A terminally-failed turn (assistant error, session idle) must never look
     // like a fresh idle session — the "quiet ≠ stuck" promise. User-initiated
     // aborts (Esc / stop) finalize with MessageAbortedError and are NOT
     // failures — a deliberate stop must not show "Failed".
-    const failed = statusType === "idle" && !!assistant?.error && !newestIsUser && !isAbortError(assistant.error)
+    const failed = !pendingUser && statusType === "idle" && !!assistant?.error && !newestIsUser && !isAbortError(assistant.error)
 
     return {
       tool,
@@ -360,10 +370,23 @@ function StatusPanel(props: { api: TuiPluginApi; session_id: string }) {
   // Heartbeat: fine tick (in-row refresh) + session events (both gated above).
   const timer = setInterval(sync, TICK_MS)
   timer.unref?.()
-  const offs = [
-    props.api.event.on("message.part.updated", sync),
-    props.api.event.on("message.updated", sync),
-  ]
+  const events = [
+    "message.part.updated",
+    "message.updated",
+    "session.status",
+    "session.idle",
+    "permission.asked",
+    "permission.v2.asked",
+    "permission.replied",
+    "permission.v2.replied",
+    "question.asked",
+    "question.v2.asked",
+    "question.replied",
+    "question.v2.replied",
+    "question.rejected",
+    "question.v2.rejected",
+  ] as const
+  const offs = events.map((type) => props.api.event.on(type, sync))
   onCleanup(() => {
     for (const off of offs) off()
     clearInterval(timer)

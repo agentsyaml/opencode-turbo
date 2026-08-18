@@ -21,6 +21,7 @@ const RETRY_PATTERNS = [
   "connection closed",
   "connection lost",
   "connection terminated",
+  "unable to connect",
   "connection aborted",
   "econnreset",
   "econnrefused",

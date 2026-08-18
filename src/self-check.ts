@@ -3,8 +3,8 @@
 
 import { isAbortError, isRecoverable } from "./matcher.ts"
 import { estimateTokens, formatDuration } from "./util.ts"
-import { isEmptyOutput, stallCandidates, trackAction } from "./stall.ts"
-import { completionOf, contentToolTokens, lastAssistantOf, panelRow, runningToolOf, textTokensOf, thinkingTokensOf, toolInputTokensOf } from "./tui.tsx"
+import { idleAction, isActiveStatus, isEmptyOutput, stallCandidates, trackAction } from "./stall.ts"
+import { completionOf, contentToolTokens, hasPendingUserRequest, lastAssistantOf, panelRow, runningToolOf, textTokensOf, thinkingTokensOf, toolInputTokensOf } from "./tui.tsx"
 
 function expect(actual: boolean, expected: boolean, label: string): void {
   if (actual !== expected) {
@@ -32,6 +32,7 @@ expect(isRecoverable({ name: "APIError", data: { message: "Unprocessable entity"
 
 // Never recover on user abort or permanent errors.
 expect(isRecoverable({ name: "MessageAbortedError", data: { message: "operation was aborted" } }), false, "user abort is excluded")
+expect(isRecoverable({ name: "AbortError", message: "Aborted" }), false, "abort error is excluded")
 expect(isRecoverable({ name: "APIError", data: { message: "Unauthorized: invalid api key", statusCode: 401, isRetryable: false } }), false, "401 auth error is excluded")
 expect(isRecoverable({ name: "UnknownError", data: { message: "Model not found" } }), false, "unknown permanent error is excluded")
 
@@ -45,6 +46,7 @@ expect(isRecoverable({ name: "APIError", data: { message: "Provider is overloade
 expect(isRecoverable({ name: "UnknownError", data: { message: "Bad request" } }), true, "bad request text is recoverable")
 expect(isRecoverable({ name: "UnknownError", data: { message: "usage limit" } }), true, "usage limit is recoverable")
 expect(isRecoverable({ name: "UnknownError", data: { message: "disconnected" } }), true, "disconnected is recoverable")
+expect(isRecoverable({ name: "UnknownError", data: { message: "Unable to connect to provider" } }), true, "unable to connect is recoverable")
 expect(isRecoverable({ name: "UnknownError", data: { message: "reasoning_opaque" } }), true, "reasoning_opaque is recoverable")
 expect(isRecoverable({ name: "UnknownError", data: { message: "expected string, received undefined" } }), true, "zod validation error is recoverable")
 expect(isRecoverable({ name: "UnknownError", data: { message: "Invalid input for tool" } }), true, "invalid tool input is recoverable")
@@ -76,12 +78,16 @@ if (estimateTokens("") !== 0) { console.error("FAIL: estimateTokens empty"); pro
 if (formatDuration(500) !== "500ms") { console.error("FAIL: formatDuration ms"); process.exit(1) }
 if (formatDuration(1500) !== "1.5s") { console.error("FAIL: formatDuration s"); process.exit(1) }
 if (formatDuration(90_000) !== "1m 30s") { console.error("FAIL: formatDuration min"); process.exit(1) }
+if (!isActiveStatus("working") || isActiveStatus("idle") || isActiveStatus("unknown")) { console.error("FAIL: session status classification"); process.exit(1) }
 console.log("ok: shared helpers (estimateTokens, formatDuration)")
 
 // TUI panel store helpers (pure).
 if (lastAssistantOf([{ type: "user" }, { id: "a1", type: "assistant", time: { completed: 1 } }])?.id !== "a1") { console.error("FAIL: lastAssistantOf"); process.exit(1) }
 if (lastAssistantOf([{ role: "assistant", id: "a2" }, { role: "user" }])?.id !== "a2") { console.error("FAIL: lastAssistantOf v1 role"); process.exit(1) }
 if (lastAssistantOf(undefined) !== undefined) { console.error("FAIL: lastAssistantOf empty"); process.exit(1) }
+if (!hasPendingUserRequest([{ id: "p1" }], [])) { console.error("FAIL: pending permission request"); process.exit(1) }
+if (!hasPendingUserRequest([], [{ id: "q1" }])) { console.error("FAIL: pending question request"); process.exit(1) }
+if (hasPendingUserRequest([], [])) { console.error("FAIL: no pending user request"); process.exit(1) }
 if (thinkingTokensOf([{ type: "reasoning", text: "12345678" }, { type: "text", text: "ignored" }]) !== 2) { console.error("FAIL: thinkingTokensOf"); process.exit(1) }
 if (thinkingTokensOf(undefined) !== 0) { console.error("FAIL: thinkingTokensOf empty"); process.exit(1) }
 if (textTokensOf([{ type: "text", text: "中文" }, { type: "text", text: "12345678" }]) !== 4) { console.error("FAIL: textTokensOf"); process.exit(1) }
@@ -163,13 +169,32 @@ console.log("ok: extended coverage (mixed content, edge cases)")
   if (t.action !== "track" || t.sessionID !== "s1") { console.error("FAIL: trackAction part.updated"); process.exit(1) }
 }
 {
-  const t = trackAction("message.updated", { info: { sessionID: "s2" } })
+  const t = trackAction("message.updated", { info: { sessionID: "s2", role: "assistant" } })
   if (t.action !== "track" || t.sessionID !== "s2") { console.error("FAIL: trackAction message.updated"); process.exit(1) }
 }
+if (trackAction("message.updated", { info: { sessionID: "s2", role: "assistant", finish: "stop" } }).action !== "clear") { console.error("FAIL: terminal message.updated finish"); process.exit(1) }
+if (trackAction("message.updated", { info: { sessionID: "s2", role: "assistant", error: {} } }).action !== "clear") { console.error("FAIL: terminal message.updated error"); process.exit(1) }
 {
-  const t = trackAction("session.status", { sessionID: "s3" })
+  const t = trackAction("session.status", { sessionID: "s3", status: { type: "busy" } })
   if (t.action !== "track" || t.sessionID !== "s3") { console.error("FAIL: trackAction session.status"); process.exit(1) }
 }
+for (const status of ["idle", "retry"]) {
+  const t = trackAction("session.status", { sessionID: "s3", status: { type: status } })
+  if (t.action !== "clear" || t.sessionID !== "s3") { console.error(`FAIL: trackAction session.status ${status}`); process.exit(1) }
+}
+for (const type of ["permission.updated", "permission.asked", "permission.v2.asked", "question.asked", "question.v2.asked"]) {
+  const t = trackAction(type, { sessionID: "s7", id: "r1" })
+  if (t.action !== "pause" || t.sessionID !== "s7" || t.requestID !== "r1") { console.error(`FAIL: trackAction ${type} pause`); process.exit(1) }
+}
+for (const type of ["permission.replied", "permission.v2.replied", "question.replied", "question.v2.replied", "question.rejected", "question.v2.rejected"]) {
+  const key = type.startsWith("permission.replied") ? "permissionID" : "requestID"
+  const t = trackAction(type, { sessionID: "s7", [key]: "r1" })
+  if (t.action !== "resume" || t.sessionID !== "s7" || t.requestID !== "r1") { console.error(`FAIL: trackAction ${type} resume`); process.exit(1) }
+}
+if ("requestID" in trackAction("question.asked", { sessionID: "s9" })) { console.error("FAIL: missing request ID pause must be session-wide"); process.exit(1) }
+if ("requestID" in trackAction("question.rejected", { sessionID: "s9" })) { console.error("FAIL: missing request ID resume must be session-wide"); process.exit(1) }
+if (idleAction("s8", true).action !== "pause") { console.error("FAIL: idle with pending request stays paused"); process.exit(1) }
+if (idleAction("s8", false).action !== "clear") { console.error("FAIL: idle without pending request clears"); process.exit(1) }
 {
   const t = trackAction("session.idle", { sessionID: "s4" })
   if (t.action !== "clear" || t.sessionID !== "s4") { console.error("FAIL: trackAction session.idle"); process.exit(1) }
@@ -199,8 +224,15 @@ console.log("ok: stall watchdog (trackAction, stallCandidates)")
 
 // Reasoning-only message: empty output, must be recovered.
 if (!isEmptyOutput({ parts: [{ type: "reasoning", text: "thinking..." }] })) { console.error("FAIL: isEmptyOutput reasoning only"); process.exit(1) }
-// No parts at all: empty.
-if (!isEmptyOutput({})) { console.error("FAIL: isEmptyOutput no parts"); process.exit(1) }
+for (const type of ["step-start", "step-finish", "snapshot", "patch", "compaction"]) {
+  if (!isEmptyOutput({ parts: [{ type: "reasoning" }, { type }] })) { console.error(`FAIL: isEmptyOutput structural ${type}`); process.exit(1) }
+}
+// Missing or unknown parts are unsafe to classify as empty.
+if (isEmptyOutput({})) { console.error("FAIL: isEmptyOutput missing parts is unknown"); process.exit(1) }
+if (isEmptyOutput({ parts: "unknown" })) { console.error("FAIL: isEmptyOutput unknown parts"); process.exit(1) }
+if (isEmptyOutput({ parts: [{ type: "future-part" }] })) { console.error("FAIL: isEmptyOutput unknown part type"); process.exit(1) }
+// An explicit empty parts array is an empty response.
+if (!isEmptyOutput({ parts: [] })) { console.error("FAIL: isEmptyOutput explicit empty parts"); process.exit(1) }
 // Real text: not empty.
 if (isEmptyOutput({ parts: [{ type: "reasoning", text: "thinking" }, { type: "text", text: "answer" }] })) { console.error("FAIL: isEmptyOutput with text"); process.exit(1) }
 // Tool call: not empty (the model is acting, not silent).
@@ -211,8 +243,8 @@ if (isEmptyOutput({ parts: [{ type: "agent" }] })) { console.error("FAIL: isEmpt
 if (!isEmptyOutput({ parts: [{ type: "text", text: "   " }] })) { console.error("FAIL: isEmptyOutput whitespace"); process.exit(1) }
 // Synthetic/ignored parts do not count as output.
 if (!isEmptyOutput({ parts: [{ type: "text", text: "x", synthetic: true }] })) { console.error("FAIL: isEmptyOutput synthetic"); process.exit(1) }
-// Empty message object with no parts.
-if (!isEmptyOutput(undefined)) { console.error("FAIL: isEmptyOutput undefined"); process.exit(1) }
+// Missing parts are unknown and must not trigger recovery.
+if (isEmptyOutput(undefined)) { console.error("FAIL: isEmptyOutput undefined is unknown"); process.exit(1) }
 
 console.log("ok: empty-output detection (isEmptyOutput)")
 

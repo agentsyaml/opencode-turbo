@@ -8,109 +8,173 @@ import {
   BACKOFF_MAX_MS,
   MAX_ATTEMPTS,
   RE_FETCH_WAIT_MS,
-  REVERT_WAIT_MS,
   SETTLE_MS,
   TERMINAL_DELAY_MS,
   TRIGGER_DEDUPE_MS,
   buildContinuation,
+  candidateAssistant,
   createState,
-  emptyOutputAssistant,
-  failedAssistant,
   partialText,
   sleep,
+  targetAssistant,
   toPromptPart,
   type MessageLike,
   type PromptPart,
+  type RecoveryOptions,
   type SessionState,
 } from "./core"
-import { errorText, isRecoverable } from "./matcher"
+import { errorText, isAbortError, isRecoverable } from "./matcher"
 import { createNotifications } from "./notify"
-import { isEmptyOutput, stallCandidates, trackAction } from "./stall"
-
-// ─────────────────────────────────────────────────────────────────────────────
-// opencode-turbo
-//
-// Zero-config recovery for provider errors opencode does not retry by default:
-//  - mid-stream closures ("provider closed the stream before sending a
-//    completion marker", "upstream connection ended mid-stream") that reach a
-//    terminal state (session.error) instead of the retry path
-//  - 4xx status codes (400/402/403/405/408/409/422/429) that opencode treats
-//    as non-retryable
-//  - provider/model-output errors (bad request, reasoning_opaque, malformed
-//    tool calls) where a retry lets the model fix itself
-//
-// The plugin acts ONLY on terminal failures (session.error / message.updated
-// with an assistant error). It never interferes with opencode's own retry
-// loop: retryable errors keep opencode's unbounded exponential retry
-// untouched, and only failures opencode gave up on get recovered here.
-//
-// Recovery = abort -> capture partial assistant output -> revert to the last
-// user message -> re-send a continuation prompt with the partial content so
-// the model resumes exactly where it was interrupted. Always retries with the
-// same model (no fallback model to configure).
-// ─────────────────────────────────────────────────────────────────────────────
-
-// ── Logging ────────────────────────────────────────────────────────────────
-// File-based only: console output leaks into the TUI as raw terminal noise.
-
+import { idleAction, isActiveStatus, isEmptyOutput, stallCandidates, trackAction } from "./stall"
 const logPath = join(homedir(), ".local", "share", "opencode", "logs", "auto-recover.log")
-
-// Stall watchdog: a silent stream (TCP alive, SSE silent) never errors, so it
-// never reaches the recovery paths above. Event silence while generating is
-// the hang signal. Default 30min; override via plugin options stallTimeoutMs.
 const STALL_TIMEOUT_MS = 30 * 60_000
 const STALL_CHECK_MS = 30_000 // watchdog scan interval
-
 async function log(message: string): Promise<void> {
   try {
     await mkdir(dirname(logPath), { recursive: true })
     await appendFile(logPath, `[${new Date().toISOString()}] ${message}\n`, "utf-8")
   } catch {
-    // logging must never break the plugin
   }
 }
-
-// ── Plugin ──────────────────────────────────────────────────────────────────
-
 const plugin: Plugin = async ({ client }: PluginInput, options: PluginOptions = {}): Promise<Hooks> => {
   const states = new Map<string, SessionState>()
-  // Stall watchdog: sessionID -> last event timestamp. Only sessions that
-  // produced generation events are watched; idle/error/deleted clear them.
   const activity = new Map<string, number>()
+  const paused = new Set<string>()
+  const pendingUser = new Set<string>()
+  const pendingRequests = new Map<string, Set<string>>()
+  const pendingWithoutID = new Map<string, number>()
+  const parentBySession = new Map<string, string>()
+  const knownSessions = new Set<string>()
+  const unknownParentPending = new Set<string>()
   const stallTimeoutMs = typeof options.stallTimeoutMs === "number" ? options.stallTimeoutMs : STALL_TIMEOUT_MS
   const notify = createNotifications(client)
   void log("PLUGIN LOADED — opencode-turbo ready (recovery + stall watchdog + notifications)")
-
   const getState = (sessionID: string): SessionState => {
-    let state = states.get(sessionID)
-    if (!state) {
-      state = createState()
-      states.set(sessionID, state)
-    }
-    return state
+    const state = states.get(sessionID) ?? createState(); states.set(sessionID, state); return state
   }
-
   function backoff(attempt: number): number {
     return Math.min(BACKOFF_BASE_MS * 2 ** (attempt - 1), BACKOFF_MAX_MS)
   }
-
-  /**
-   * Single-flight recovery for a session. Increments the attempt counter,
-   * aborts any in-flight generation / opencode retry loop, captures the
-   * partial assistant output, reverts to the last user message and re-sends a
-   * continuation prompt with the same model.
-   */
-  async function recover(sessionID: string, reason: string, opts: { delay?: boolean; emptyOutput?: boolean } = {}): Promise<void> {
+  function refreshPauseState(): void {
+    paused.clear()
+    for (const child of pendingUser) {
+      const seen = new Set<string>()
+      let current = child
+      while (current && !seen.has(current)) {
+        seen.add(current)
+        paused.add(current)
+        current = parentBySession.get(current) ?? ""
+      }
+    }
+    for (const id of activity.keys()) if (paused.has(id)) activity.delete(id)
+  }
+  const isBlocked = (sessionID: string) => paused.has(sessionID)
+  function noteActivity(sessionID: string, now: number): void {
+    if (isBlocked(sessionID)) return
+    activity.set(sessionID, now)
+    let parent = parentBySession.get(sessionID)
+    const seen = new Set<string>()
+    while (parent && !seen.has(parent)) { if (isBlocked(parent)) break; activity.set(parent, now); seen.add(parent); parent = parentBySession.get(parent) }
+  }
+  function hasDirectPending(sessionID: string): boolean {
+    return (pendingWithoutID.get(sessionID) ?? 0) > 0 || (pendingRequests.get(sessionID)?.size ?? 0) > 0
+  }
+  function addPending(sessionID: string, requestID?: string): void {
+    if (requestID) {
+      const requests = pendingRequests.get(sessionID) ?? new Set<string>(); requests.add(requestID); pendingRequests.set(sessionID, requests)
+    } else pendingWithoutID.set(sessionID, (pendingWithoutID.get(sessionID) ?? 0) + 1)
+    pendingUser.add(sessionID)
+    refreshPauseState()
+    void ensureParentChain(sessionID)
+  }
+  function removePending(sessionID: string, requestID?: string): void {
+    if (requestID) {
+      const requests = pendingRequests.get(sessionID)
+      requests?.delete(requestID)
+      if (requests?.size === 0) pendingRequests.delete(sessionID)
+    } else { pendingRequests.delete(sessionID); pendingWithoutID.delete(sessionID) }
+    if (!hasDirectPending(sessionID)) {
+      pendingUser.delete(sessionID)
+      unknownParentPending.delete(sessionID)
+    }
+    refreshPauseState()
+    drainDeferredRecoveries()
+  }
+  function clearSessionPending(sessionID: string): void {
+    pendingRequests.delete(sessionID); pendingWithoutID.delete(sessionID); pendingUser.delete(sessionID); unknownParentPending.delete(sessionID)
+    refreshPauseState(); drainDeferredRecoveries()
+  }
+  function isInternalAbort(sessionID: string, messageID?: string): boolean { const state = getState(sessionID); return state.internalAbortGeneration === state.recoveryGeneration && state.internalAbortGeneration !== undefined && (!messageID || messageID === state.internalAbortMessageID) }
+  function cancelRecovery(sessionID: string): void {
     const state = getState(sessionID)
+    state.recoveryGeneration++; state.internalAbortGeneration = undefined; state.internalAbortMessageID = undefined; state.pendingRecovery = undefined; state.lastRecoveredMessageID = undefined
+    state.lastErrorKey = undefined; state.lastErrorTime = 0
+    clearSessionPending(sessionID)
+  }
+  async function readMessages(sessionID: string, phase: string): Promise<MessageLike[] | undefined> {
+    const res = await client.session.messages({ path: { id: sessionID } }).catch(async (err) => {
+      await log(`${phase} ${sessionID}: messages threw: ${err instanceof Error ? err.message : String(err)}`)
+      return undefined
+    })
+    if (res?.error) {
+      const { name, message } = errorText(res.error)
+      await log(`${phase} ${sessionID}: messages failed: ${name}: ${message}`)
+      return undefined
+    }
+    return res ? ((res.data ?? []) as MessageLike[]) : undefined
+  }
+  async function serviceStatus(sessionID: string): Promise<{ failed: boolean; type?: string }> { const res = await client.session.status().catch(() => undefined); if (!res || res.error) return { failed: true }; const type = (res.data as Record<string, { type?: unknown }> | undefined)?.[sessionID]?.type; return { failed: false, ...(typeof type === "string" ? { type } : {}) } }
+  async function ensureParentChain(requestSession: string): Promise<void> {
+    let current = requestSession
+    const seen = new Set<string>()
+    while (pendingUser.has(requestSession) && current && !seen.has(current)) {
+      seen.add(current)
+      if (!knownSessions.has(current)) {
+        unknownParentPending.add(requestSession)
+        refreshPauseState()
+        const res = await client.session.get({ path: { id: current } }).catch(() => undefined)
+        if (!res || res.error || !res.data) return
+        const info = res.data as { id?: string; parentID?: string }
+        knownSessions.add(current)
+        if (typeof info.parentID === "string" && info.parentID) parentBySession.set(current, info.parentID)
+        else parentBySession.delete(current)
+      }
+      const parent = parentBySession.get(current)
+      if (!parent) {
+        unknownParentPending.delete(requestSession)
+        refreshPauseState()
+        drainDeferredRecoveries()
+        return
+      }
+      current = parent
+      unknownParentPending.add(requestSession)
+      refreshPauseState()
+    }
+  }
+  function rememberSession(info: unknown): void {
+    if (typeof info !== "object" || info === null) return
+    const value = info as { id?: unknown; parentID?: unknown }
+    if (typeof value.id !== "string") return
+    knownSessions.add(value.id)
+    if (typeof value.parentID === "string" && value.parentID) parentBySession.set(value.id, value.parentID)
+    else parentBySession.delete(value.id)
+    refreshPauseState()
+    for (const pending of pendingUser) void ensureParentChain(pending)
+    drainDeferredRecoveries()
+  }
+  async function recover(sessionID: string, reason: string, opts: RecoveryOptions = {}): Promise<void> {
+    const state = getState(sessionID)
+    const generation = state.recoveryGeneration
+    const cancelled = () => state.recoveryGeneration !== generation
     if (state.recovering) {
-      // Queue: a terminal failure arriving while a recovery is in flight must
-      // not be silently dropped — its trigger event was already consumed by
-      // burstGate. Replayed in `finally` once the in-flight recovery ends.
-      state.pendingError = reason
+      state.pendingRecovery = { reason, ...opts }
       return
     }
     if (state.gaveUp) return
-
+    if (isBlocked(sessionID)) {
+      state.pendingRecovery = { reason, ...opts }
+      return
+    }
     state.recovering = true
     try {
       const attempt = state.attempts + 1
@@ -119,116 +183,91 @@ const plugin: Plugin = async ({ client }: PluginInput, options: PluginOptions = 
         await log(`GIVING UP on ${sessionID} after ${MAX_ATTEMPTS} attempts (last: ${reason})`)
         return
       }
-      // The attempt counter is committed only when a continuation is actually
-      // sent, so aborted attempts (e.g. the failure not being visible yet) do
-      // not burn the budget.
-      await log(`RECOVER ${sessionID} attempt ${attempt}/${MAX_ATTEMPTS} — ${reason}`)
-
-      // 1. Stop any in-flight generation FIRST, before any sleep: a live
-      //    generation that succeeds during a backoff wait would otherwise get
-      //    reverted as a "failed" message. The SDK client resolves HTTP errors
-      //    instead of rejecting, so check the result too.
-      const abortRes = await client.session.abort({ path: { id: sessionID } }).catch(async (err) => {
-        await log(`RECOVER ${sessionID}: abort threw: ${err instanceof Error ? err.message : String(err)}`)
-        return undefined
-      })
-      if (abortRes?.error) {
-        const { name, message } = errorText(abortRes.error)
-        await log(`RECOVER ${sessionID}: abort failed: ${name}: ${message}`)
-      }
-      await sleep(SETTLE_MS)
-
-      if (attempt > 1) await sleep(backoff(attempt))
-      if (opts.delay) await sleep(TERMINAL_DELAY_MS)
-
-      // 2. Read the conversation. On an HTTP error the client resolves with
-      //    {error, data: undefined} instead of rejecting — log it, don't
-      //    pretend the session is empty.
-      const res = await client.session.messages({ path: { id: sessionID } }).catch(async (err) => {
-        await log(`RECOVER ${sessionID}: messages threw: ${err instanceof Error ? err.message : String(err)}`)
-        return undefined
-      })
-      if (res?.error) {
-        const { name, message } = errorText(res.error)
-        await log(`RECOVER ${sessionID}: messages failed: ${name}: ${message}`)
+      await log(`RECOVER ${sessionID} attempt ${attempt}/${MAX_ATTEMPTS} — ${reason}`); if (cancelled()) return
+      let messages = await readMessages(sessionID, "RECOVER")
+      if (cancelled()) return
+      if (!messages || messages.length === 0) {
+        await log(`RECOVER ${sessionID}: no messages, skipping recovery`)
         return
       }
-      const messages = (res?.data ?? []) as MessageLike[]
-      if (messages.length === 0) {
-        await log(`RECOVER ${sessionID}: no messages, aborting recovery`)
-        return
-      }
-
-      // The failure we are recovering from. The abort finalizes the failed
-      // message asynchronously, so a fetch racing the finalization may miss
-      // the error; re-read once before giving up.
-      let lastAssistant = failedAssistant(messages)
-      if (!lastAssistant && opts.emptyOutput) lastAssistant = emptyOutputAssistant(messages)
-      if (!lastAssistant) {
+      let candidate = candidateAssistant(messages, opts)
+      if (!candidate) {
         await sleep(RE_FETCH_WAIT_MS)
-        const retry = await client.session.messages({ path: { id: sessionID } }).catch(async (err) => {
-          await log(`RECOVER ${sessionID}: re-fetch threw: ${err instanceof Error ? err.message : String(err)}`)
-          return undefined
-        })
-        if (retry?.error) {
-          // A transient re-fetch failure is not a genuine unrecoverable state —
-          // log it and back off WITHOUT burning an attempt.
-          const { name, message } = errorText(retry.error)
-          await log(`RECOVER ${sessionID}: re-fetch failed: ${name}: ${message}`)
-          return
-        }
-        lastAssistant = failedAssistant((retry?.data ?? []) as MessageLike[])
-        if (!lastAssistant && opts.emptyOutput) lastAssistant = emptyOutputAssistant((retry?.data ?? []) as MessageLike[])
+        if (cancelled()) return
+        messages = await readMessages(sessionID, "RECOVER")
+        if (cancelled()) return
+        candidate = messages ? candidateAssistant(messages, opts) : undefined
       }
-      if (!lastAssistant) {
-        // Commit the attempt so a persistently un-recoverable failure (e.g. the
-        // error never lands on the message) still trips MAX_ATTEMPTS instead of
-        // looping the full recovery cycle every TRIGGER_DEDUPE_MS forever.
-        state.attempts = attempt
-        await log(`RECOVER ${sessionID}: no interrupted message found, skipping recovery`)
+      if (!candidate?.info?.id) {
+        await log(`RECOVER ${sessionID}: no current interrupted message, skipping recovery`)
         return
       }
+      const targetID = opts.targetMessageID ?? candidate.info.id
+      messages = await readMessages(sessionID, "RECOVER")
+      if (cancelled()) return
+      candidate = messages ? targetAssistant(messages, targetID, Boolean(opts.emptyOutput)) : undefined
+      if (!messages || !candidate) {
+        await log(`RECOVER ${sessionID}: target ${targetID} is stale, skipping recovery`)
+        return
+      }
+      if (isBlocked(sessionID)) {
+        state.pendingRecovery = { reason, ...opts }
+        return
+      }
+      const status = await serviceStatus(sessionID)
+      if (cancelled()) return
+      messages = await readMessages(sessionID, "PREFLIGHT"); candidate = messages ? targetAssistant(messages, targetID, Boolean(opts.emptyOutput)) : undefined
+      if (cancelled()) return
+      if (!messages || !candidate) { if (opts.stall) activity.delete(sessionID); return }
+      if (isBlocked(sessionID)) { state.pendingRecovery = { reason, ...opts }; return }
+      const terminalTarget = Boolean(opts.emptyOutput || candidate.info?.error)
+      if (status.failed) {
+        state.pendingRecovery = { reason, ...opts }
+        await sleep(backoff(attempt))
+        return
+      }
+      if (status.type === undefined && !terminalTarget) {
+        await log(`RECOVER ${sessionID}: target ${targetID} has no active status`); if (opts.stall) activity.delete(sessionID)
+        return
+      }
+      if (status.type !== undefined && (terminalTarget ? status.type !== "idle" : !isActiveStatus(status.type))) {
+        if (!terminalTarget) { await log(`RECOVER ${sessionID}: target ${targetID} is no longer active`); if (opts.stall) activity.delete(sessionID); return }
+        state.pendingRecovery = { reason, ...opts }
+        await sleep(backoff(attempt))
+        return
+      }
+      if (!opts.emptyOutput && !candidate.info?.error) {
+        state.internalAbortGeneration = generation
+        state.internalAbortMessageID = targetID
+        const abortRes = await client.session.abort({ path: { id: sessionID } }).catch(async (err) => { await log(`RECOVER ${sessionID}: abort threw: ${err instanceof Error ? err.message : String(err)}`); return undefined })
+        state.internalAbortGeneration = undefined
+        state.internalAbortMessageID = undefined
+        if (cancelled()) return
+        if (!abortRes || abortRes.error) {
+          const { name, message } = errorText(abortRes?.error)
+          await log(`RECOVER ${sessionID}: abort failed: ${name}: ${message}`)
+          if (!state.pendingRecovery) state.pendingRecovery = { reason, ...opts }; await sleep(backoff(attempt)); return
+        }
+        await sleep(SETTLE_MS)
+        if (cancelled()) return
+      }
+      if (attempt > 1) { await sleep(backoff(attempt)); if (cancelled()) return }
+      if (opts.delay) { await sleep(TERMINAL_DELAY_MS); if (cancelled()) return }
+      messages = await readMessages(sessionID, "RECOVER")
+      if (cancelled()) return
+      const lastAssistant = messages ? targetAssistant(messages, targetID, Boolean(opts.emptyOutput)) : undefined
+      if (!messages || !lastAssistant) { await log(`RECOVER ${sessionID}: target ${targetID} changed, skipping recovery`); if (opts.stall) activity.delete(sessionID); return }
+      if (cancelled() || isBlocked(sessionID)) { if (!cancelled()) state.pendingRecovery = { reason, ...opts }; return }
       const partial = partialText(lastAssistant)
       const hasModel = Boolean(lastAssistant.info?.providerID && lastAssistant.info.modelID)
-      const model = hasModel
-        ? { providerID: lastAssistant.info!.providerID!, modelID: lastAssistant.info!.modelID! }
-        : undefined
-
+      const model = hasModel ? { providerID: lastAssistant.info!.providerID!, modelID: lastAssistant.info!.modelID! } : undefined
       const lastUser = [...messages].reverse().find((m) => m.info?.role === "user")
-      if (!lastUser?.info?.id) {
-        await log(`RECOVER ${sessionID}: no user message to revert to, aborting recovery`)
-        return
-      }
-
-      // 3. Remove the interrupted assistant message. Revert failure is a hard
-      //    stop: appending a continuation on top of the still-failed message
-      //    would corrupt the history, so bail instead.
-      const revertRes = await client.session
-        .revert({ path: { id: sessionID }, body: { messageID: lastUser.info.id } })
-        .catch(async (err) => {
-          await log(`RECOVER ${sessionID}: revert threw: ${err instanceof Error ? err.message : String(err)}`)
-          return undefined
-        })
-      if (!revertRes || revertRes.error) {
-        const { name, message } = errorText(revertRes?.error)
-        await log(`RECOVER ${sessionID}: revert failed (${name}: ${message}), abandoning recovery`)
-        return
-      }
-      await sleep(REVERT_WAIT_MS)
-
-      // Commit the attempt only now: the recovery is genuinely proceeding.
-      // Notify here too, so the toast fires only for recoveries that actually
-      // act (not for cycles that immediately bail). Also clear the dedupe key
-      // so a fresh failure of the same signature still triggers recovery.
+      if (!lastUser?.info?.id) { await log(`RECOVER ${sessionID}: no user message, aborting recovery`); return }
       state.attempts = attempt
       notify.onRecoveryStart(sessionID, attempt, MAX_ATTEMPTS)
       state.lastRecoveredMessageID = lastAssistant.info?.id
       state.lastErrorKey = undefined
       state.lastErrorTime = 0
-
-      // 4. Re-send: continuation with partial content, the original user parts,
-      //    or a generic nudge when nothing resendable is available (e.g. the
-      //    last user message only carried tool results).
       let parts: PromptPart[]
       if (partial) {
         parts = [{ type: "text", text: buildContinuation(partial) }]
@@ -243,7 +282,6 @@ const plugin: Plugin = async ({ client }: PluginInput, options: PluginOptions = 
           },
         ]
       }
-
       const promptRes = await client.session
         .prompt({
           path: { id: sessionID },
@@ -253,35 +291,29 @@ const plugin: Plugin = async ({ client }: PluginInput, options: PluginOptions = 
             parts,
           },
         })
-        .catch(async (err) => {
-          await log(`RECOVER ${sessionID}: prompt threw: ${err instanceof Error ? err.message : String(err)}`)
-          return undefined
-        })
-      if (promptRes?.error) {
-        const { name, message } = errorText(promptRes.error)
+        .catch(async (err) => { await log(`RECOVER ${sessionID}: prompt threw: ${err instanceof Error ? err.message : String(err)}`); return undefined })
+      if (cancelled()) { state.lastRecoveredMessageID = undefined; return }
+      if (!promptRes || promptRes.error) {
+        const { name, message } = errorText(promptRes?.error)
         await log(`RECOVER ${sessionID}: continuation prompt failed: ${name}: ${message}`)
-      } else {
-        await log(`RECOVER ${sessionID}: continuation prompt sent (attempt ${attempt})`)
+        if (state.lastRecoveredMessageID === targetID) state.lastRecoveredMessageID = undefined
+        if (!state.pendingRecovery) state.pendingRecovery = { reason, ...opts }; await sleep(backoff(attempt)); return
       }
+      await log(`RECOVER ${sessionID}: continuation prompt sent (attempt ${attempt})`)
     } catch (err) {
       await log(`RECOVER ${sessionID} failed: ${err instanceof Error ? err.message : String(err)}`)
     } finally {
       state.recovering = false
-      const pending = state.pendingError
-      if (pending) {
-        state.pendingError = undefined
-        void recover(sessionID, pending)
-      }
+      const pending = state.pendingRecovery
+      if (pending && !isBlocked(sessionID)) { state.pendingRecovery = undefined; void recover(sessionID, pending.reason, pending) }
     }
   }
-
-  /**
-   * Deduplicate trigger events for one failure. The same failure surfaces as
-   * session.error AND message.updated, and the message finalization can delay
-   * the second event past the abort window. Key on the error signature with a
-   * generous window; the key is cleared once a continuation is actually sent,
-   * so a fresh failure of the same kind still triggers.
-   */
+  function drainDeferredRecoveries(): void {
+    for (const [sessionID, state] of states) {
+      const pending = state.pendingRecovery
+      if (pending && !state.recovering && !isBlocked(sessionID)) { state.pendingRecovery = undefined; void recover(sessionID, pending.reason, pending) }
+    }
+  }
   function burstGate(state: SessionState, error: unknown): boolean {
     const { name, message } = errorText(error)
     const key = `${name}:${message}`
@@ -291,48 +323,38 @@ const plugin: Plugin = async ({ client }: PluginInput, options: PluginOptions = 
     state.lastErrorTime = now
     return true
   }
-
-  const handleTerminalError = (sessionID: string, error: unknown) => {
+  const handleTerminalError = async (sessionID: string, error: unknown, targetMessageID?: string) => {
     if (!isRecoverable(error)) {
-      // Log so permanently-ignored failures stay diagnosable (they would
-      // otherwise be invisible — the plugin only acts on recoverable ones).
-      const { name, message } = errorText(error)
-      if (message || name) void log(`NOT-RECOVERABLE ${sessionID}: ${name}: ${message}`)
-      return
+      const { name, message } = errorText(error); if (message || name) void log(`NOT-RECOVERABLE ${sessionID}: ${name}: ${message}`); return
     }
     const state = getState(sessionID)
-    if (!burstGate(state, error)) return
+    const generation = state.recoveryGeneration
     const { name, message } = errorText(error)
-    void recover(sessionID, message || name, { delay: true })
-  }
-
-  /**
-   * Terminal-finish settlement. Reads the finished message from the store:
-   * empty output (thinking with nothing to show) is a silent model-side
-   * failure and goes through recovery WITHOUT resetting the chain; real
-   * output resets the chain as success. Deduped per message id by the caller.
-   */
-  async function settleFinished(sessionID: string, messageID: string): Promise<void> {
-    await sleep(TERMINAL_DELAY_MS) // let the message finalize before reading
-    const res = await client.session.messages({ path: { id: sessionID } }).catch(async (err) => {
-      await log(`SETTLE ${sessionID}: messages threw: ${err instanceof Error ? err.message : String(err)}`)
-      return undefined
-    })
-    if (res?.error) {
-      const { name, message } = errorText(res.error)
-      await log(`SETTLE ${sessionID}: messages failed: ${name}: ${message}`)
-      return
+    let targetID = targetMessageID
+    if (!targetID) {
+      const messages = await readMessages(sessionID, "ERROR"); const last = messages?.[messages.length - 1]
+      if (state.recoveryGeneration !== generation) return
+      if (last?.info?.role !== "assistant" || !last.info.error || !last.info.id) return; targetID = last.info.id
     }
-    const messages = (res?.data ?? []) as MessageLike[]
+    if (state.recoveryGeneration !== generation) return
+    if (!burstGate(state, error)) return
+    void recover(sessionID, message || name, { delay: true, targetMessageID: targetID })
+  }
+  async function settleFinished(sessionID: string, messageID: string): Promise<void> {
+    const state = getState(sessionID)
+    const generation = state.recoveryGeneration
+    await sleep(TERMINAL_DELAY_MS) // let the message finalize before reading
+    if (state.recoveryGeneration !== generation) return
+    const messages = await readMessages(sessionID, "SETTLE")
+    if (state.recoveryGeneration !== generation) return
+    if (!messages) return
     const finished = messages.find((m) => m.info?.id === messageID)
     if (finished && isEmptyOutput(finished)) {
-      const state = getState(sessionID)
       if (state.recovering) return // recovery in flight; its own event will settle
-      void recover(sessionID, `EMPTY_OUTPUT: ${messageID} finished with no output`, { delay: true, emptyOutput: true })
+      void recover(sessionID, `EMPTY_OUTPUT: ${messageID} finished with no output`, { delay: true, emptyOutput: true, targetMessageID: messageID })
       return
     }
-    // Real output (or message not found — nothing to verify): success path.
-    const state = getState(sessionID)
+    if (!finished) return
     if ((state.attempts > 0 || state.gaveUp) && !state.recovering) {
       state.attempts = 0
       state.gaveUp = false
@@ -342,89 +364,79 @@ const plugin: Plugin = async ({ client }: PluginInput, options: PluginOptions = 
       await log(`SUCCESS ${sessionID}: recovery chain completed, attempts reset`)
     }
   }
-
-  // Stall watchdog: scan the activity map; any watched session that went
-  // silent past the timeout is presumed hung and recovered like a failure.
-  // The recovery aborts the hung stream, which finalizes the message (error
-  // "Aborted" lands on it), so the normal recover() path picks it up as the
-  // interrupted assistant message and re-sends the continuation.
   const stallTimer = stallTimeoutMs > 0
     ? setInterval(() => {
         const now = Date.now()
         for (const id of stallCandidates(activity, now, stallTimeoutMs)) {
           const state = getState(id)
+          if (isBlocked(id)) {
+            activity.delete(id)
+            continue
+          }
           if (state.gaveUp) {
             activity.delete(id)
             continue
           }
           const quietFor = Math.round((now - (activity.get(id) ?? now)) / 60_000)
-          // Re-arm BEFORE recovering: recovery itself may take a while, and the
-          // resumed generation resets the timestamp via new events anyway.
           activity.set(id, now)
-          void recover(id, `STALL_TIMEOUT: no events for ~${quietFor}min`)
+          void (async () => {
+            const generation = state.recoveryGeneration
+            if (isBlocked(id)) return
+            const messages = await readMessages(id, "STALL")
+            const target = messages?.[messages.length - 1]
+            if (state.recoveryGeneration !== generation || activity.get(id) !== now || isBlocked(id)) return
+            if (target?.info?.role !== "assistant" || !target.info.id || target.info.error) return
+            if (!messages || !targetAssistant(messages, target.info.id, false)) return
+            void recover(id, `STALL_TIMEOUT: no events for ~${quietFor}min`, { targetMessageID: target.info.id, stall: true })
+          })()
         }
       }, STALL_CHECK_MS)
     : undefined
   stallTimer?.unref?.()
-
   return {
     event: async ({ event }: { event: Event }): Promise<void> => {
       try {
-        // Stall watchdog bookkeeping first: any generation-progress event is
-        // liveness proof; terminal events stop the watch. Independent of the
-        // recovery switch below.
         const track = trackAction(event.type, event.properties)
         if (track.action === "track" && track.sessionID) {
-          activity.set(track.sessionID, Date.now())
+          if (isBlocked(track.sessionID)) { paused.add(track.sessionID); activity.delete(track.sessionID) }
+          else { noteActivity(track.sessionID, Date.now()); drainDeferredRecoveries() }
+        } else if (track.action === "pause" && track.sessionID) {
+          addPending(track.sessionID, track.requestID)
+        } else if (track.action === "resume" && track.sessionID) {
+          removePending(track.sessionID, track.requestID)
         } else if (track.action === "clear" && track.sessionID) {
           activity.delete(track.sessionID)
+          if (event.type === "session.idle" && idleAction(track.sessionID, pendingUser.has(track.sessionID)).action === "pause") paused.add(track.sessionID)
+          refreshPauseState(); drainDeferredRecoveries()
+          if (event.type === "session.error") {
+            const props = event.properties as { error?: unknown }
+            if ((props.error === undefined || isAbortError(props.error)) && !isInternalAbort(track.sessionID)) cancelRecovery(track.sessionID)
+          }
         }
-
         switch (event.type) {
-          // session.status retry events are never acted on — opencode's own
-          // (unbounded, exponential-backoff) retry loop is left untouched.
-          // They are only surfaced as a notification toast.
+          case "session.created":
+          case "session.updated":
+            rememberSession((event.properties as { info?: unknown }).info)
+            return
           case "session.status": {
             const props = event.properties as { sessionID: string; status: { type: string; attempt?: number; message?: string } }
-            if (props.status?.type === "retry" && typeof props.sessionID === "string") {
-              notify.onSessionStatusRetry(props.sessionID, props.status.attempt ?? 0, props.status.message ?? "")
-            }
+            if (props.status?.type === "retry" && typeof props.sessionID === "string") notify.onSessionStatusRetry(props.sessionID, props.status.attempt ?? 0, props.status.message ?? "")
             return
           }
-
           case "session.error": {
             const props = event.properties as { sessionID?: string; error?: unknown }
-            if (typeof props.sessionID === "string") handleTerminalError(props.sessionID, props.error)
+            if (typeof props.sessionID === "string") void handleTerminalError(props.sessionID, props.error)
             return
           }
-
           case "message.updated": {
             const info = (event.properties as { info?: MessageLike["info"] }).info
             if (!info?.sessionID || info.role !== "assistant") return
             if (info.error) {
-              // The original failure's delayed message.updated error can arrive
-              // after the recovery finished — never re-recover the message we
-              // just recovered FROM.
+              if (isAbortError(info.error)) { if (!isInternalAbort(info.sessionID, info.id)) cancelRecovery(info.sessionID); return }
               const state = getState(info.sessionID)
               if (info.id && info.id === state.lastRecoveredMessageID) return
-              handleTerminalError(info.sessionID, info.error)
+              void handleTerminalError(info.sessionID, info.error, info.id)
             } else if (info.finish && info.finish !== "tool-calls" && info.finish !== "unknown") {
-              // Terminal finish. Two mutually exclusive outcomes, decided
-              // asynchronously by reading the message store (the event carries
-              // no parts):
-              //   - empty output (thinking with nothing to show — repetition
-              //     loops, truncation): a silent model-side failure. Recover
-              //     WITHOUT resetting the chain — it is a failure, not success.
-              //   - real output: successful completion; reset the attempt
-              //     counter so a later failure starts a fresh chain.
-              // NOTE: neither `finish` alone nor `time.completed` proves a
-              // turn ended — multi-step turns set BOTH per segment mid-turn
-              // (finish:"tool-calls", completed stamped by cleanup). Only a
-              // TERMINAL finish reason (anything but "tool-calls"/"unknown")
-              // proves the message truly ended. Never reset while a recovery
-              // is in flight, and never reset on the message we just recovered
-              // FROM — its late completion event must not count as chain
-              // success.
               const state = getState(info.sessionID)
               if (info.id && info.id === state.lastRecoveredMessageID) return
               if (info.id && info.id === state.lastEmptyCheckMessageID) return
@@ -432,8 +444,6 @@ const plugin: Plugin = async ({ client }: PluginInput, options: PluginOptions = 
                 state.lastEmptyCheckMessageID = info.id
                 void settleFinished(info.sessionID, info.id)
               } else if ((state.attempts > 0 || state.gaveUp) && !state.recovering) {
-                // No message id to verify against: fall back to the old
-                // success-only reset path (cannot tell empty from full).
                 state.attempts = 0
                 state.gaveUp = false
                 state.lastRecoveredMessageID = undefined
@@ -444,10 +454,27 @@ const plugin: Plugin = async ({ client }: PluginInput, options: PluginOptions = 
             }
             return
           }
-
           case "session.deleted": {
             const info = (event.properties as { info?: { id?: string } }).info
-            if (info?.id) states.delete(info.id)
+            if (info?.id) {
+              states.delete(info.id)
+              activity.delete(info.id)
+              pendingRequests.delete(info.id)
+              pendingWithoutID.delete(info.id)
+              pendingUser.delete(info.id)
+              unknownParentPending.delete(info.id)
+              knownSessions.delete(info.id)
+              parentBySession.delete(info.id)
+              for (const [child, parent] of parentBySession) {
+                if (parent === info.id) {
+                  parentBySession.delete(child)
+                  knownSessions.delete(child)
+                  if (pendingUser.has(child)) { unknownParentPending.add(child); void ensureParentChain(child) }
+                }
+              }
+              refreshPauseState()
+              drainDeferredRecoveries()
+            }
             return
           }
         }
@@ -461,5 +488,4 @@ const plugin: Plugin = async ({ client }: PluginInput, options: PluginOptions = 
     },
   }
 }
-
 export default plugin

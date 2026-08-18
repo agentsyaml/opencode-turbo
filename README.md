@@ -42,8 +42,8 @@ a terminal failure:
   a successful completion, so no error ever fires. The plugin verifies the
   finished message and re-sends the original request.
 
-Recovery per session: abort → capture the partial output → revert to the last
-user message → re-send a continuation prompt with the same model. Guardrails:
+Recovery per session: abort when needed → capture the partial output → append a
+continuation prompt while retaining the full history. Guardrails:
 user aborts, auth errors and permanent failures are never recovered; at most
 10 consecutive recoveries with exponential backoff capped at 30 minutes
 (counter resets on success); OpenCode's own unbounded retry loop is never
