@@ -2,7 +2,7 @@
 // Run with: bun run src/self-check.ts
 
 import { isAbortError, isRecoverable } from "./matcher.ts"
-import { isBlockedSession, matchesInternalAbort } from "./core.ts"
+import { createState, isBlockedSession, MAX_PREFLIGHT_ATTEMPTS } from "./core.ts"
 import { estimateTokens, formatDuration } from "./util.ts"
 import { idleAction, isActiveStatus, isEmptyOutput, stallCandidates, trackAction } from "./stall.ts"
 import { completionOf, contentToolTokens, hasPendingUserRequest, lastAssistantOf, panelRow, runningToolOf, textTokensOf, thinkingTokensOf, toolInputTokensOf } from "./tui.tsx"
@@ -15,67 +15,110 @@ function expect(actual: boolean, expected: boolean, label: string): void {
   console.log(`ok: ${label}`)
 }
 
-// The exact error the user reported — mid-stream closure.
-expect(
-  isRecoverable({
-    name: "UnknownError",
-    data: { message: "provider closed the stream before sending a completion marker (upstream connection ended mid-stream)" },
-  }),
-  true,
-  "completion marker stream error is recoverable",
-)
+// Explicit API status policy. Authentication and other permanent statuses do
+// not recover, even when their text resembles a transient service failure.
+for (const statusCode of [400, 402, 403, 405, 408, 409, 422, 429, 500, 502, 503, 504, 524, 529]) {
+  expect(isRecoverable({ name: "APIError", data: { message: "provider failure", statusCode } }), true, `API status ${statusCode} is recoverable`)
+}
+expect(isRecoverable({ name: "APIError", data: { message: "Unauthorized: invalid api key", statusCode: 401 } }), false, "401 auth error is excluded")
+expect(isRecoverable({ name: "APIError", data: { message: "Model not found", statusCode: 404 } }), false, "404 not-found error is excluded")
+expect(isRecoverable({ name: "APIError", data: { message: "payload too large", statusCode: 413 } }), false, "413 payload error is excluded")
+for (const message of ["context overflow", "context window exceeded", "too large to compact", "output length exceeded"]) {
+  expect(isRecoverable({ name: "APIError", data: { message, statusCode: 400 } }), false, `${message} is permanent`)
+}
+for (const message of ["invalid diff", "Invalid input for tool"]) {
+  expect(isRecoverable({ name: "APIError", data: { message, statusCode: 400 } }), false, `API ${message} is excluded`)
+  expect(isRecoverable({ name: "UnknownError", data: { message } }), false, `Unknown ${message} is excluded`)
+}
 
-// 4xx status codes opencode does not retry by default.
-expect(isRecoverable({ name: "APIError", data: { message: "Bad request: invalid field", statusCode: 400, isRetryable: false } }), true, "400 is recoverable")
-expect(isRecoverable({ name: "APIError", data: { message: "Forbidden: blocked by gateway", statusCode: 403, isRetryable: false } }), true, "403 is recoverable")
-expect(isRecoverable({ name: "APIError", data: { message: "Method not allowed", statusCode: 405, isRetryable: false } }), true, "405 is recoverable")
-expect(isRecoverable({ name: "APIError", data: { message: "Unprocessable entity", statusCode: 422, isRetryable: false } }), true, "422 is recoverable")
+// Without a status code, only an explicit APIError may use the small service
+// message allowlist.
+for (const message of ["service unavailable", "bad gateway", "internal server error", "too many requests", "rate limit exceeded"]) {
+  expect(isRecoverable({ name: "APIError", data: { message } }), true, `API message ${message} is recoverable`)
+  expect(isRecoverable({ name: "UnknownError", data: { message } }), false, `UnknownError ${message} is ignored`)
+}
 
-// Never recover on user abort or permanent errors.
-expect(isRecoverable({ name: "MessageAbortedError", data: { message: "operation was aborted" } }), false, "user abort is excluded")
-expect(isRecoverable({ name: "AbortError", message: "Aborted" }), false, "abort error is excluded")
-expect(isRecoverable({ name: "APIError", data: { message: "Unauthorized: invalid api key", statusCode: 401, isRetryable: false } }), false, "401 auth error is excluded")
-expect(isRecoverable({ name: "UnknownError", data: { message: "Model not found" } }), false, "unknown permanent error is excluded")
+// Explicit SQL classes accept only the two known transient database failures.
+for (const name of ["SqlError", "SQLite", "SQLiteError", "Database", "DatabaseError"]) {
+  expect(isRecoverable({ name, data: { message: "Failed to execute statement" } }), true, `${name} execute failure is recoverable`)
+  expect(isRecoverable({ name, data: { message: "database is locked" } }), true, `${name} lock is recoverable`)
+}
+expect(isRecoverable({ name: "UnknownError", data: { message: "Failed to execute statement" } }), false, "unclassified SQL text is ignored")
+expect(isRecoverable({ name: "UnknownError", data: { message: "Failed query: insert into session (id) values (?)" } }), true, "failed query SQL shape is recoverable")
+expect(isRecoverable({ name: "UnknownError", data: { message: "Failed query: something went wrong" } }), false, "failed query non-SQL text is ignored")
+expect(isRecoverable({ name: "UnknownError", data: { message: "invalid query" } }), false, "invalid query text is ignored")
+expect(isRecoverable({ name: "UnknownError", data: { message: "insert into session (id) values (?)" } }), false, "arbitrary SQL text is ignored")
+expect(isRecoverable({ name: "SqlError", data: { message: "invalid query" } }), false, "generic SQL error is ignored")
+expect(isRecoverable({ name: "SqlError", data: { message: "Failed query: something went wrong" } }), false, "non-SQL failed query is ignored")
 
-// Transient patterns matched from the error text alone.
-expect(isRecoverable({ name: "UnknownError", data: { message: "upstream connection ended mid-stream" } }), true, "upstream connection ended is recoverable")
-expect(isRecoverable({ name: "UnknownError", data: { message: "overloaded" } }), true, "overloaded is recoverable")
-expect(isRecoverable({ name: "UnknownError", data: { message: "rate limit exceeded" } }), true, "rate limit is recoverable")
-expect(isRecoverable({ name: "APIError", data: { message: "Provider is overloaded", statusCode: 503, isRetryable: true } }), true, "503 is recoverable")
+// Narrow connection and transport failures remain recoverable without an API
+// wrapper.
+for (const message of [
+  "connection reset by peer",
+  "connection closed",
+  "connection lost",
+  "connection terminated",
+  "connection refused",
+  "reset by peer",
+  "unable to connect to provider",
+  "ECONNRESET",
+  "socket hang up",
+  "socket closed",
+  "network error",
+  "fetch failed",
+  "request timed out",
+  "connection timed out",
+  "response timeout",
+  "idle timeout",
+  "read timed out",
+  "SSE timeout",
+  "ETIMEDOUT",
+  "broken pipe",
+  "EPIPE",
+  "stream closed",
+  "stream ended",
+  "premature close",
+]) {
+  expect(isRecoverable({ name: "UnknownError", data: { message } }), true, `${message} is recoverable`)
+}
 
-// Patterns borrowed from the reference plugins (auto-continue / fallback).
-expect(isRecoverable({ name: "UnknownError", data: { message: "Bad request" } }), true, "bad request text is recoverable")
-expect(isRecoverable({ name: "UnknownError", data: { message: "usage limit" } }), true, "usage limit is recoverable")
-expect(isRecoverable({ name: "UnknownError", data: { message: "disconnected" } }), true, "disconnected is recoverable")
-expect(isRecoverable({ name: "UnknownError", data: { message: "Unable to connect to provider" } }), true, "unable to connect is recoverable")
-expect(isRecoverable({ name: "UnknownError", data: { message: "reasoning_opaque" } }), true, "reasoning_opaque is recoverable")
-expect(isRecoverable({ name: "UnknownError", data: { message: "expected string, received undefined" } }), true, "zod validation error is recoverable")
-expect(isRecoverable({ name: "UnknownError", data: { message: "Invalid input for tool" } }), true, "invalid tool input is recoverable")
-
-// No match -> stay out of the way.
+// Model/tool output, generic text, certificates and message-only service
+// errors must stay out of the recovery path.
+for (const message of [
+  "completion marker",
+  "mid-stream",
+  "stream error",
+  "disconnected",
+  "Bad request",
+  "reasoning_opaque",
+  "Invalid input for tool",
+  "unknown certificate verification error",
+  "SSL handshake failed: connection reset",
+  "overloaded",
+  "rate limit exceeded",
+  "timeout",
+  "tool timeout",
+  "operation was aborted",
+]) {
+  expect(isRecoverable({ name: "UnknownError", data: { message } }), false, `UnknownError ${message} is ignored`)
+}
+expect(isRecoverable({ name: "APIError", data: { message: "operation was aborted" } }), false, "bare abort text is not an API retry pattern")
 expect(isRecoverable({ name: "UnknownError", data: { message: "some unrelated failure" } }), false, "unrelated errors are ignored")
 
-// opencode's SQLite layer (transient lock contention).
-expect(isRecoverable({ name: "SqlError", data: { message: "Failed to execute statement" } }), true, "sqlite execute failure is recoverable")
-expect(isRecoverable({ name: "SqlError", data: { message: "database is locked" } }), true, "sqlite lock is recoverable")
-
-// TLS / certificate family — Bun <1.4 mislabels mid-handshake resets as
-// certificate errors (oven-sh/bun#31950); those are transient and retryable.
-expect(isRecoverable({ name: "Error", data: { message: "unknown certificate verification error" } }), true, "bun certificate verification mislabel is recoverable")
-expect(isRecoverable({ name: "Error", message: "UNKNOWN_CERTIFICATE_VERIFICATION_ERROR: unknown certificate verification error" }), true, "certificate verification code is recoverable")
-expect(isRecoverable({ name: "Error", data: { message: "unable to get local issuer certificate" } }), true, "unable to get issuer is recoverable")
-expect(isRecoverable({ name: "Error", data: { message: "self-signed certificate in certificate chain" } }), true, "self-signed cert is recoverable")
-expect(isRecoverable({ name: "Error", data: { message: "SSL handshake failed: connection reset" } }), true, "ssl handshake failure is recoverable")
-
 // User-initiated aborts are deliberate stops, not failures.
-expect(isAbortError({ name: "MessageAbortedError", data: { message: "operation was aborted" } }), true, "abort error is detected")
-expect(isAbortError({ name: "AbortError", message: "Aborted" }), true, "dom aborterror is detected")
+for (const name of ["MessageAbortedError", "APIUserAbortError", "UICancelledError"]) {
+  expect(isRecoverable({ name, data: { message: "operation was aborted" } }), false, `${name} is excluded`)
+  expect(isAbortError({ name }), true, `${name} is detected`)
+}
+expect(isRecoverable({ name: "AbortError", message: "Aborted" }), false, "DOM abort is not recoverable")
+expect(isRecoverable({ name: "AbortError", message: "fetch failed" }), false, "transport-named abort is not recoverable")
+expect(isAbortError({ name: "AbortError", message: "Aborted" }), true, "DOM aborterror is detected")
+expect(isAbortError({ name: "AbortError", message: "fetch failed" }), true, "raw AbortError is always an abort")
 expect(isAbortError({ name: "UnknownError", data: { message: "provider closed the stream" } }), false, "non-abort error is not an abort")
 
-expect(matchesInternalAbort(3, 3, "m1", "m1"), true, "matching internal abort marker is recognized")
-expect(matchesInternalAbort(3, 3, "m1", "m2"), false, "different abort message does not match")
 expect(isBlockedSession("child", new Set(), new Set(["child"])), true, "unknown parent pending blocks its session")
 expect(isBlockedSession("other", new Set(), new Set(["child"])), false, "unknown parent pending stays local")
+if (MAX_PREFLIGHT_ATTEMPTS !== 3 || createState().preflightAttempts !== 0) { console.error("FAIL: bounded preflight state"); process.exit(1) }
 
 // Shared pure helpers.
 if (estimateTokens("12345678") !== 2) { console.error("FAIL: estimateTokens ascii"); process.exit(1) }
@@ -217,18 +260,19 @@ if (trackAction("message.part.removed", {}).action !== "ignore") { console.error
 if (trackAction("unknown.event", {}).action !== "ignore") { console.error("FAIL: trackAction unknown ignored"); process.exit(1) }
 if (trackAction("session.status", {}).action !== "ignore") { console.error("FAIL: trackAction missing sessionID"); process.exit(1) }
 
-// stallCandidates: only sessions quiet longer than the timeout qualify.
+// stallCandidates remains a pure helper; the event path does not recover stalls.
 const activity = new Map([["s1", 1_000_000], ["s2", 2_000_000], ["s3", 1_500_000]])
 if (JSON.stringify(stallCandidates(activity, 2_100_000, 600_000)) !== '["s1"]') { console.error("FAIL: stallCandidates basic"); process.exit(1) }
 if (stallCandidates(new Map(), 2_100_000, 600_000).length !== 0) { console.error("FAIL: stallCandidates empty"); process.exit(1) }
 // Exact boundary: now - last === timeout does NOT qualify (strictly greater).
 if (stallCandidates(new Map([["s1", 1_500_000]]), 2_100_000, 600_000).length !== 0) { console.error("FAIL: stallCandidates boundary"); process.exit(1) }
 
-console.log("ok: stall watchdog (trackAction, stallCandidates)")
+console.log("ok: stall helpers (trackAction, stallCandidates)")
 
-// ── Empty-output detection (thinking with nothing to show) ───────────────────
+// ── Empty-output detection helper (never an automatic recovery trigger) ───────
 
-// Reasoning-only message: empty output, must be recovered.
+// Reasoning-only message: the helper identifies empty output, but the plugin
+// does not automatically send another prompt for it.
 if (!isEmptyOutput({ parts: [{ type: "reasoning", text: "thinking..." }] })) { console.error("FAIL: isEmptyOutput reasoning only"); process.exit(1) }
 for (const type of ["step-start", "step-finish", "snapshot", "patch", "compaction"]) {
   if (!isEmptyOutput({ parts: [{ type: "reasoning" }, { type }] })) { console.error(`FAIL: isEmptyOutput structural ${type}`); process.exit(1) }

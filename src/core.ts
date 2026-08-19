@@ -4,15 +4,12 @@
 // plugin function: opencode's legacy plugin loader treats every export of the
 // entry module as a plugin, so pure helpers must live in a separate module.
 
-import { isEmptyOutput } from "./stall"
-
 export const MAX_ATTEMPTS = 10 // consecutive recoveries per session before giving up
 export const BACKOFF_BASE_MS = 1_000 // exponential backoff: 2s, 4s, 8s, ... capped at 30min
 export const BACKOFF_MAX_MS = 1_800_000 // 30 minutes
 export const TRIGGER_DEDUPE_MS = 10_000 // same error signature within this window is one failure
 export const RE_FETCH_WAIT_MS = 500 // re-read messages when the failure is not visible yet
-export const SETTLE_MS = 200 // wait after abort before reading messages
-export const INTERNAL_ABORT_GRACE_MS = 10_000 // absorb late abort events without masking later user aborts
+export const MAX_PREFLIGHT_ATTEMPTS = 3 // bounded status/message readiness probes per recovery
 export const TERMINAL_DELAY_MS = 500 // wait before acting on a terminal error so message finalizes
 export const MAX_PARTIAL_CHARS = 12_000 // tail of partial output fed to the continuation prompt
 
@@ -55,36 +52,28 @@ export type PromptPart = { type: "text"; text: string } | { type: "file"; mime: 
 export interface SessionState {
   recovering: boolean
   recoveryGeneration: number
-  internalAbortGeneration?: number
-  internalAbortMessageID?: string
   attempts: number
+  preflightAttempts: number
   lastErrorKey?: string
   lastErrorTime: number
   lastRecoveredMessageID?: string
-  lastEmptyCheckMessageID?: string
   gaveUp: boolean
   pendingRecovery?: RecoveryOptions & { reason: string }
 }
 
 export type RecoveryOptions = {
   delay?: boolean
-  emptyOutput?: boolean
   targetMessageID?: string
-  stall?: boolean
 }
 
 export const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
 export function createState(): SessionState {
-  return { recovering: false, recoveryGeneration: 0, attempts: 0, lastErrorTime: 0, gaveUp: false }
+  return { recovering: false, recoveryGeneration: 0, attempts: 0, preflightAttempts: 0, lastErrorTime: 0, gaveUp: false }
 }
 
 export function isBlockedSession(sessionID: string, paused: ReadonlySet<string>, unknownParentPending: ReadonlySet<string>): boolean {
   return paused.has(sessionID) || unknownParentPending.has(sessionID)
-}
-
-export function matchesInternalAbort(markerGeneration: number | undefined, recoveryGeneration: number, markerMessageID: string | undefined, messageID?: string): boolean {
-  return markerGeneration === recoveryGeneration && markerGeneration !== undefined && (messageID === undefined || messageID === markerMessageID)
 }
 
 /** Concatenated text of an assistant message's text parts, or null. */
@@ -113,37 +102,18 @@ export function failedAssistant(messages: MessageLike[]): MessageLike | undefine
   return undefined
 }
 
-/** Last assistant message for empty-output recovery: completed, no error. */
-export function emptyOutputAssistant(messages: MessageLike[]): MessageLike | undefined {
-  const last = messages[messages.length - 1]
-  if (last?.info?.role !== "assistant") return undefined
-  if (last.info.error) return undefined
-  return last
-}
-
-export function targetAssistant(messages: MessageLike[], targetID: string, emptyOutput: boolean): MessageLike | undefined {
+export function targetAssistant(messages: MessageLike[], targetID: string): MessageLike | undefined {
   const index = messages.findIndex((message) => message.info?.id === targetID && message.info.role === "assistant")
   if (index < 0 || messages.slice(index + 1).some((message) => message.info?.role === "user" || message.info?.role === "assistant")) return undefined
   const target = messages[index]
   const info = target.info
   if (!info) return undefined
-  if (emptyOutput) {
-    const finished = typeof info.finish === "string" && info.finish.length > 0 && info.finish !== "tool-calls" && info.finish !== "unknown"
-    return !info.error && finished && isEmptyOutput(target) ? target : undefined
-  }
   if (info.error || info.finish === "tool-calls" || info.finish === "unknown") return target
   return !info.finish && info.time?.completed === undefined ? target : undefined
 }
 
 export function candidateAssistant(messages: MessageLike[], opts: RecoveryOptions): MessageLike | undefined {
-  if (opts.targetMessageID) return targetAssistant(messages, opts.targetMessageID, Boolean(opts.emptyOutput))
-  const failed = failedAssistant(messages)
-  if (failed) return failed
-  if (opts.emptyOutput) {
-    const empty = emptyOutputAssistant(messages)
-    if (empty && isEmptyOutput(empty)) return empty
-  }
-  return undefined
+  return opts.targetMessageID ? targetAssistant(messages, opts.targetMessageID) : failedAssistant(messages)
 }
 
 export function buildContinuation(partial: string): string {

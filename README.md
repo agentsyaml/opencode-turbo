@@ -1,16 +1,15 @@
 # opencode-turbo
 
-Peace of mind for OpenCode. Long-running sessions fail in two ways: provider
-errors OpenCode doesn't retry, and the quiet fear that a session has silently
-stalled. This plugin fixes both — zero config, zero options.
+Peace of mind for OpenCode. Long-running sessions can hit provider failures
+that OpenCode does not retry, while the live status line makes session activity
+visible. This plugin handles the explicit failure cases — zero config.
 
 ## Why
 
-- **Errors handle themselves.** When a session hits a terminal failure OpenCode
-  gives up on, the plugin recovers it automatically: it captures what the model
-  already produced and re-sends a continuation prompt with the same model, so
-  the work resumes exactly where it stopped. No babysitting, no lost output,
-  no re-running an hour-long session.
+- **Explicit transient failures handle themselves.** When a session hits a
+  matching API, SQL, or connection/transport failure, the plugin captures what
+  the model already produced and re-sends a continuation prompt with the same
+  model, so the work resumes from where it stopped.
 - **You can see it working.** A single live status line in the sidebar shows
   exactly what OpenCode is doing right now — thinking, writing, running a
   tool — so a quiet screen never looks like a stuck one. Step away; come back
@@ -21,60 +20,31 @@ stalled. This plugin fixes both — zero config, zero options.
 ### Auto-recovery
 
 Recovers the response from the exact interruption point when a session hits
-a terminal failure:
+a matching API, SQL, or connection/transport failure:
 
-- mid-stream closures (`provider closed the stream before sending a completion
-  marker`) that reach `session.error` instead of OpenCode's retry path —
-  common with the `task` tool / sub-agents
-- status codes OpenCode treats as non-retryable: 400, 402, 403, 405, 408,
-  409, 422, 429 (plus 500, 502, 503, 504, 524, 529)
-- model-output errors a retry lets the model fix itself (`bad request`,
-  `reasoning_opaque`, malformed tool calls)
-- transient SQLite errors (`Failed to execute statement`,
-  `database is locked`) from concurrent OpenCode instances
-- TLS/certificate errors — Bun <1.4 mislabels mid-handshake connection resets
-  as `UNKNOWN_CERTIFICATE_VERIFICATION_ERROR` (oven-sh/bun#31950); those are
-  transient network failures worth retrying. Genuine cert problems (expired,
-  self-signed, missing issuer) are permanent and burn attempts — the recovery
-  guardrails (attempt cap + backoff) keep that bounded.
-- **Empty output** — a turn that finishes after thinking with nothing to show
-  (repetition loops, truncation) is a silent model-side failure: opencode sees
-  a successful completion, so no error ever fires. The plugin verifies the
-  finished message and re-sends the original request.
+- explicit `APIError` status codes: 400, 402, 403, 405, 408, 409, 422, 429
+  (plus 500, 502, 503, 504, 524, 529); without a status code, only a small
+  set of explicit service messages is accepted, never the same text from an
+  unclassified error
+- explicit SQL/SQLite/Database errors containing `Failed to execute
+  statement` or `database is locked`; `Failed query:` is accepted without an
+  error class only when it is immediately followed by a SQL statement keyword
+  such as `insert`, `select`, or `update`
+- narrow connection/transport failures such as connection reset/closed/lost,
+  `ECONN*`, unable to connect, socket hang up, fetch failure, request/connection/
+  response/read/SSE timeouts, `ETIMEDOUT`, broken pipe, and stream
+  closed/ended or premature close
 
-Recovery per session: abort when needed → capture the partial output → append a
-continuation prompt while retaining the full history. Guardrails:
-user aborts, auth errors and permanent failures are never recovered; at most
-10 consecutive recoveries with exponential backoff capped at 30 minutes
-(counter resets on success); OpenCode's own unbounded retry loop is never
-touched. Logs: `~/.local/share/opencode/logs/auto-recover.log`.
-
-### Stall watchdog
-
-A silent stream stall — TCP alive, SSE silent — produces **no error**, so
-OpenCode never retries and never times out: the session hangs in thinking
-forever. The watchdog treats **event silence while generating** as the hang
-signal:
-
-- any generation-progress event (`message.part.updated`, `message.updated`,
-  `session.status`) proves the stream is alive; `session.idle`/`session.error`
-  stop the watch
-- a session that emits nothing for the stall timeout (default **30 minutes**)
-  is recovered like a failure: abort → the hung message finalizes as the
-  interrupted message → continuation prompt re-sent with the same model
-- legitimate long reasoning is never misjudged: reasoning streams keep
-  emitting parts, so only truly quiet sessions trigger
-
-Configure the timeout via plugin options:
-
-```json
-{
-  "plugin": [["@alexsun-top/opencode-turbo", { "stallTimeoutMs": 1800000 }]]
-}
-```
-
-(Set `0` to disable the watchdog.) The same recovery guardrails apply — at
-most 10 attempts with backoff, counter resets on success.
+Recovery per session: verify the failed assistant message → capture the partial
+output → append a continuation prompt while retaining the full history. Guardrails:
+user stops, auth errors, permanent failures, model/tool output errors,
+TLS/certificate errors, empty output, and silent stalls are never recovered;
+model/tool errors stay excluded even when an API status code would otherwise be
+retryable. Status preflight probes are bounded to three attempts and only wait
+for the failed message to become ready; they do not widen the error matcher.
+at most 10 consecutive recoveries with exponential backoff capped at 30 minutes
+(counter resets on success); OpenCode's own retry loop is never touched. Logs:
+`~/.local/share/opencode/logs/auto-recover.log`.
 
 ### Live status line
 
