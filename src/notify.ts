@@ -34,6 +34,7 @@ function short(text: string, max: number): string {
 export interface Notifications {
   onSessionStatusRetry(sessionID: string, attempt: number, message: string): void
   onRecoveryStart(sessionID: string, attempt: number, maxAttempts: number): void
+  onRecoveryStopped(sessionID: string, message: string): void
   dispose(): void
 }
 
@@ -86,6 +87,10 @@ export function createNotifications(client: PluginInput["client"]): Notification
     liveToast(`recover:${sessionID}`, "🔄 Auto-recovering", `attempt ${attempt}/${maxAttempts}`, "info")
   }
 
+  function onRecoveryStopped(_sessionID: string, message: string): void {
+    showToast("⛔ Auto-recovery stopped", short(message, MAX_MESSAGE_CHARS), "error", DONE_DURATION_MS)
+  }
+
   function dispose(): void {
     for (const slot of slots.values()) {
       if (slot.timer) clearTimeout(slot.timer)
@@ -96,6 +101,7 @@ export function createNotifications(client: PluginInput["client"]): Notification
   return {
     onSessionStatusRetry,
     onRecoveryStart,
+    onRecoveryStopped,
     dispose,
   }
 }

@@ -37,6 +37,7 @@ export interface MessageLike {
     id?: string
     sessionID?: string
     role?: string
+    parentID?: string
     error?: unknown
     agent?: string
     providerID?: string
@@ -54,9 +55,15 @@ export interface SessionState {
   recoveryGeneration: number
   attempts: number
   preflightAttempts: number
+  recoveryRequestSequence: number
   lastErrorKey?: string
   lastErrorTime: number
   lastRecoveredMessageID?: string
+  lastRecoveredRequestSequence?: number
+  activeRecoveryPromptMessageID?: string
+  recoveryCancelled: boolean
+  recoveryPromptMessageIDs: Set<string>
+  recoveryPromptRequestSequences: Map<string, number>
   gaveUp: boolean
   pendingRecovery?: RecoveryOptions & { reason: string }
 }
@@ -64,12 +71,100 @@ export interface SessionState {
 export type RecoveryOptions = {
   delay?: boolean
   targetMessageID?: string
+  requestSequence?: number
 }
 
 export const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
 export function createState(): SessionState {
-  return { recovering: false, recoveryGeneration: 0, attempts: 0, preflightAttempts: 0, lastErrorTime: 0, gaveUp: false }
+  return { recovering: false, recoveryGeneration: 0, attempts: 0, preflightAttempts: 0, recoveryRequestSequence: 0, lastErrorTime: 0, recoveryCancelled: false, recoveryPromptMessageIDs: new Set(), recoveryPromptRequestSequences: new Map(), gaveUp: false }
+}
+
+/** Terminal recovery transition: queued work must not be drained again. */
+export function clearPendingRecovery(state: Pick<SessionState, "pendingRecovery">): void {
+  state.pendingRecovery = undefined
+}
+
+/** Reset a completed chain without clearing an in-flight prompt marker. */
+export function resetRecoveryAfterSuccess(
+  state: Pick<SessionState, "attempts" | "preflightAttempts" | "gaveUp" | "lastRecoveredMessageID" | "lastRecoveredRequestSequence" | "activeRecoveryPromptMessageID" | "lastErrorKey" | "lastErrorTime" | "recoveryCancelled" | "recoveryPromptMessageIDs" | "recoveryPromptRequestSequences">,
+  preservePromptMarkers = false,
+): void {
+  state.attempts = 0
+  state.preflightAttempts = 0
+  state.gaveUp = false
+  state.lastRecoveredMessageID = undefined
+  state.lastRecoveredRequestSequence = undefined
+  state.activeRecoveryPromptMessageID = undefined
+  state.lastErrorKey = undefined
+  state.lastErrorTime = 0
+  if (!state.recoveryCancelled && !preservePromptMarkers) {
+    state.recoveryPromptMessageIDs.clear()
+    state.recoveryPromptRequestSequences.clear()
+  }
+}
+
+export function samePendingRecovery(current: SessionState["pendingRecovery"], expected: SessionState["pendingRecovery"]): boolean {
+  return current === expected
+}
+
+export function discardPendingRecovery(state: Pick<SessionState, "pendingRecovery">, expected: SessionState["pendingRecovery"]): boolean {
+  if (!samePendingRecovery(state.pendingRecovery, expected)) return false
+  state.pendingRecovery = undefined
+  return true
+}
+
+export function startsRecoveryChain(state: Pick<SessionState, "recovering" | "pendingRecovery" | "gaveUp">): boolean {
+  return !state.recovering && state.pendingRecovery === undefined && !state.gaveUp
+}
+
+export function messageReadFailed(messages: MessageLike[] | undefined): messages is undefined {
+  return messages === undefined
+}
+
+export function recoveryBarrierAllows(recoveryCancelled: boolean): boolean {
+  return !recoveryCancelled
+}
+
+export function isRecoveryPromptMessage(promptIDs: ReadonlySet<string>, messageID: string | undefined): boolean {
+  return messageID !== undefined && promptIDs.has(messageID)
+}
+
+export function isGenuineRecoveryUserMessage(promptIDs: ReadonlySet<string>, messageID: string | undefined): boolean {
+  return messageID !== undefined && !promptIDs.has(messageID)
+}
+
+export function recoveryRequestIsNewer(currentSequence: number | undefined, requestSequence: number): boolean {
+  return requestSequence > (currentSequence ?? -1)
+}
+
+export function recoveryRequestIsCurrent(
+  state: Pick<SessionState, "recoveryGeneration" | "recoveryRequestSequence">,
+  generation: number,
+  requestSequence: number,
+): boolean {
+  return state.recoveryGeneration === generation && state.recoveryRequestSequence === requestSequence
+}
+
+export function isRecoveryContinuation(promptIDs: ReadonlySet<string>, messageID: string | undefined): boolean {
+  return messageID !== undefined && promptIDs.has(messageID)
+}
+
+export function isCurrentRecoveryContinuation(
+  promptSequences: ReadonlyMap<string, number>,
+  messageID: string | undefined,
+  requestSequence: number,
+): boolean {
+  return messageID !== undefined && promptSequences.get(messageID) === requestSequence
+}
+
+export function isSuccessfulRecoveryContinuation(
+  promptIDs: ReadonlySet<string>,
+  promptSequences: ReadonlyMap<string, number>,
+  messageID: string | undefined,
+  requestSequence: number,
+): boolean {
+  return isRecoveryContinuation(promptIDs, messageID) && isCurrentRecoveryContinuation(promptSequences, messageID, requestSequence)
 }
 
 export function isBlockedSession(sessionID: string, paused: ReadonlySet<string>, unknownParentPending: ReadonlySet<string>): boolean {
@@ -87,7 +182,7 @@ export function partialText(message: MessageLike | undefined): string | null {
   return trimmed.length > 0 ? trimmed : null
 }
 
-/** Last (interrupted) assistant message, only if it actually failed. */
+/** Last assistant message that failed or is still finalizing. */
 export function failedAssistant(messages: MessageLike[]): MessageLike | undefined {
   // Only the last message can be the failure we recover from. If the user has
   // sent something after the failed message (e.g. during a backoff wait), the
@@ -95,11 +190,13 @@ export function failedAssistant(messages: MessageLike[]): MessageLike | undefine
   const last = messages[messages.length - 1]
   if (last?.info?.role !== "assistant") return undefined
   if (last.info.error) return last
-  // No error attached yet (message finalization timing): treat the last
-  // message as the interrupted one only while it is still unfinished. A
-  // completed response must never be treated as a failure.
-  if (!last.info.finish && last.info.time?.completed === undefined) return last
+  if (isUnfinishedAssistant(last)) return last
   return undefined
+}
+
+export function isUnfinishedAssistant(message: MessageLike | undefined): boolean {
+  const info = message?.info
+  return info?.role === "assistant" && !info.error && !info.finish && info.time?.completed === undefined
 }
 
 export function targetAssistant(messages: MessageLike[], targetID: string): MessageLike | undefined {
@@ -109,7 +206,7 @@ export function targetAssistant(messages: MessageLike[], targetID: string): Mess
   const info = target.info
   if (!info) return undefined
   if (info.error || info.finish === "tool-calls" || info.finish === "unknown") return target
-  return !info.finish && info.time?.completed === undefined ? target : undefined
+  return isUnfinishedAssistant(target) ? target : undefined
 }
 
 export function candidateAssistant(messages: MessageLike[], opts: RecoveryOptions): MessageLike | undefined {

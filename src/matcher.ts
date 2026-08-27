@@ -56,6 +56,10 @@ const PERMANENT_PATTERNS = [
   "unauthorized",
   "invalid api key",
   "authentication",
+  "authorization",
+  "forbidden",
+  "access denied",
+  "permission denied",
   "not authenticated",
   "output length",
   "context overflow",
@@ -75,6 +79,10 @@ const PERMANENT_PATTERNS = [
   "invalid input for tool",
   "tool_use ids were found without tool_result",
   "tried to call unavailable tool",
+]
+
+// These are permanent after the exact Bun false-positive shape is checked.
+const CERTIFICATE_PERMANENT_PATTERNS = [
   "certificate",
   "tls",
   "ssl",
@@ -86,6 +94,22 @@ function hasAny(text: string, patterns: readonly string[]): boolean {
 
 function isExplicitUserAbortName(name: string): boolean {
   return USER_ABORT_NAMES.has(name.toLowerCase())
+}
+
+function hasAbortIdentifier(identifiers: readonly string[]): boolean {
+  return identifiers.some((identifier) => isExplicitUserAbortName(identifier) || identifier.toLowerCase() === "aborterror")
+}
+
+function normalizeIdentifier(value: string): string {
+  return value.replace(/([a-z0-9])([A-Z])/g, "$1 $2").replace(/[_-]+/g, " ").toLowerCase()
+}
+
+function hasPermanentIdentifier(identifiers: readonly string[]): boolean {
+  const patterns = PERMANENT_PATTERNS.map(normalizeIdentifier)
+  return identifiers.some((identifier) => {
+    const normalized = normalizeIdentifier(identifier)
+    return /\bauth\b/.test(normalized) || hasAny(normalized, patterns)
+  })
 }
 
 function isConnectionError(text: string): boolean {
@@ -100,13 +124,58 @@ function isFailedQuery(message: string): boolean {
   return /failed query:\s*(?:select|insert|update|delete|replace|with|create|alter|drop|pragma|begin|commit|rollback|vacuum|attach|detach|reindex|analyze|end|savepoint|release|truncate|merge)\b/.test(message)
 }
 
-export function errorText(error: unknown): { name: string; message: string; statusCode?: number } {
-  if (!error || typeof error !== "object") return { name: "", message: "" }
+const TRANSIENT_CERTIFICATE_CODE = "UNKNOWN_CERTIFICATE_VERIFICATION_ERROR"
+const TRANSIENT_CERTIFICATE_TEXT = "unknown certificate verification error"
+const TRANSIENT_CERTIFICATE_ERROR = `Error: ${TRANSIENT_CERTIFICATE_TEXT}`
+const TRANSIENT_CERTIFICATE_FULL = `${TRANSIENT_CERTIFICATE_CODE}: ${TRANSIENT_CERTIFICATE_TEXT}`
+
+function normalizeCertificateText(text: string): string {
+  return text.toLowerCase().replace(/[_\s]+/g, " ").trim()
+}
+
+function isExactCertificateCode(text: string): boolean {
+  return text === TRANSIENT_CERTIFICATE_CODE
+}
+
+function isExactCertificateMessage(text: string): boolean {
+  return text === TRANSIENT_CERTIFICATE_ERROR || text === TRANSIENT_CERTIFICATE_FULL
+}
+
+function isTransientCertificateNetworkError(name: string, identifiers: readonly string[], message: string, dataMessage?: string): boolean {
+  const hasExactIdentifier = identifiers.some(isExactCertificateCode)
+  const isOpenCodeFallback = name === "UnknownError" && (dataMessage === TRANSIENT_CERTIFICATE_TEXT || dataMessage === TRANSIENT_CERTIFICATE_ERROR)
+  if (!hasExactIdentifier && !isOpenCodeFallback) return false
+  return message === TRANSIENT_CERTIFICATE_TEXT || isExactCertificateMessage(message)
+}
+
+function isPermanentCertificateCode(code: string | undefined): boolean {
+  if (!code || isExactCertificateCode(code)) return false
+  const normalized = normalizeCertificateText(code)
+  return /(?:certificate|cert|self signed|issuer|tls|ssl|verify)/.test(normalized)
+}
+
+function hasPermanentCertificateIdentifier(identifiers: readonly string[]): boolean {
+  return identifiers.some(isPermanentCertificateCode)
+}
+
+function hasExactCertificateIdentifier(identifiers: readonly string[]): boolean {
+  return identifiers.some(isExactCertificateCode)
+}
+
+function normalizeMessageName(value: unknown): string {
+  return typeof value === "string" && value.length > 0 ? value : ""
+}
+
+export function errorText(error: unknown): { name: string; message: string; dataMessage?: string; statusCode?: number; code?: string; identifiers: string[] } {
+  if (!error || typeof error !== "object") return { name: "", message: "", identifiers: [] }
   const e = error as Record<string, unknown>
   const data = (typeof e.data === "object" && e.data !== null ? e.data : {}) as Record<string, unknown>
-  const name = typeof e.name === "string" ? e.name : ""
+  const nestedName = normalizeMessageName(data.name)
+  const name = normalizeMessageName(e.name) || nestedName
+  const identifiers = [normalizeMessageName(e.name), nestedName, normalizeMessageName(e.code), normalizeMessageName(data.code)].filter((value): value is string => value.length > 0)
+  const dataMessage = typeof data.message === "string" ? data.message : undefined
   const message =
-    (typeof data.message === "string" ? data.message : null) ??
+    dataMessage ??
     (typeof e.message === "string" ? e.message : "")
   const statusCode =
     typeof data.statusCode === "number"
@@ -114,22 +183,30 @@ export function errorText(error: unknown): { name: string; message: string; stat
       : typeof e.statusCode === "number"
         ? e.statusCode
         : undefined
-  return { name, message, statusCode }
+  const code = normalizeMessageName(e.code) || normalizeMessageName(data.code) || nestedName || undefined
+  return { name, message, dataMessage, statusCode, code, identifiers }
 }
 
 /** Decide whether an error is worth recovering from. */
 export function isRecoverable(error: unknown): boolean {
-  const { name, message, statusCode } = errorText(error)
+  const { name, message, dataMessage, statusCode, identifiers } = errorText(error)
   const normalizedName = name.toLowerCase()
   const messageText = message.toLowerCase()
   const match = `${normalizedName}: ${messageText}`
+  const isAPIError = normalizedName === "apierror" || identifiers.some((identifier) => identifier.toLowerCase() === "apierror")
 
   // Abort names are never retryable; event handling uses the same predicate to
   // cancel recovery before any new prompt can be issued.
-  if (isExplicitUserAbortName(name) || normalizedName === "aborterror") return false
+  if (hasAbortIdentifier(identifiers)) return false
+  if (isAPIError && statusCode !== undefined && !RETRY_STATUS_CODES.has(statusCode)) return false
+  if (hasPermanentCertificateIdentifier(identifiers)) return false
+  if (hasPermanentIdentifier(identifiers)) return false
+  if (isTransientCertificateNetworkError(name, identifiers, message, dataMessage)) return true
+  if (hasExactCertificateIdentifier(identifiers)) return false
   if (normalizedName === "messageoutputlengtherror" || hasAny(match, PERMANENT_PATTERNS)) return false
+  if (hasAny(match, CERTIFICATE_PERMANENT_PATTERNS)) return false
 
-  if (normalizedName === "apierror") {
+  if (isAPIError) {
     if (statusCode !== undefined) return RETRY_STATUS_CODES.has(statusCode)
     return hasAny(messageText, API_TRANSIENT_MESSAGES) || isConnectionError(match) || isFailedQuery(messageText)
   }
@@ -142,6 +219,5 @@ export function isRecoverable(error: unknown): boolean {
 
 /** User-initiated aborts are deliberate stops, not failures. */
 export function isAbortError(error: unknown): boolean {
-  const { name } = errorText(error)
-  return isExplicitUserAbortName(name) || name.toLowerCase() === "aborterror"
+  return hasAbortIdentifier(errorText(error).identifiers)
 }

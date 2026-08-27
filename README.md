@@ -38,12 +38,24 @@ a matching API, SQL, or connection/transport failure:
 Recovery per session: verify the failed assistant message → capture the partial
 output → append a continuation prompt while retaining the full history. Guardrails:
 user stops, auth errors, permanent failures, model/tool output errors,
-TLS/certificate errors, empty output, and silent stalls are never recovered;
+empty output, and silent stalls are never recovered. TLS/certificate errors are
+never recovered except for the exact Bun code paired with one of the exact
+messages `unknown certificate verification error`,
+`Error: unknown certificate verification error`, or full
+`UNKNOWN_CERTIFICATE_VERIFICATION_ERROR: unknown certificate verification error`.
+The only code-less exception is OpenCode's exact `UnknownError` wrapper with
+`data.message` set to the exact bare message `unknown certificate verification error`
+(the exact `Error: unknown certificate verification error` serialization is also
+accepted).
+Bare certificate phrases, bare codes, and other certificate errors do not
+recover.
 model/tool errors stay excluded even when an API status code would otherwise be
-retryable. Status preflight probes are bounded to three attempts and only wait
-for the failed message to become ready; they do not widen the error matcher.
+retryable. Status preflight probes wait for both the failed message to be ready
+and the session status probe to be idle, with at most three attempts; they do
+not widen the error matcher.
 at most 10 consecutive recoveries with exponential backoff capped at 30 minutes
-(counter resets on success); OpenCode's own retry loop is never touched. Logs:
+(counter resets only after a confirmed recovery continuation succeeds); OpenCode's
+own retry loop is never touched. Logs:
 `~/.local/share/opencode/logs/auto-recover.log`.
 
 ### Live status line
@@ -68,9 +80,10 @@ looks stuck. Token counts are estimates (CJK-aware), not billing numbers.
 
 ### Notice toasts
 
-Retry-style events only: OpenCode's own retries (`⚠️ Retrying · attempt 2`)
-and auto-recovery (`🔄 Auto-recovering · 1/10`). All display is display-only;
-it never touches session state.
+Retry-style events: OpenCode's own retries (`⚠️ Retrying · attempt 2`) and
+auto-recovery (`🔄 Auto-recovering · 1/10`). Terminal recovery exhaustion also
+shows `⛔ Auto-recovery stopped`. All display is display-only; it never touches
+session state.
 
 ## Install
 
@@ -89,9 +102,6 @@ Local development — point at the source:
 ```
 
 No configuration. Restart OpenCode after changing config.
-
-> The TUI status line is served from `dist/tui.js`. After editing `src/tui.tsx`,
-> run `bun run build:tui` — otherwise the sidebar line silently won't load.
 
 > The TUI status line is served from `dist/tui.js`. After editing `src/tui.tsx`,
 > run `bun run build:tui` — otherwise the sidebar line silently won't load.

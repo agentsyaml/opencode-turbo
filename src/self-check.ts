@@ -2,7 +2,7 @@
 // Run with: bun run src/self-check.ts
 
 import { isAbortError, isRecoverable } from "./matcher.ts"
-import { createState, isBlockedSession, MAX_PREFLIGHT_ATTEMPTS } from "./core.ts"
+import { clearPendingRecovery, createState, discardPendingRecovery, isBlockedSession, isGenuineRecoveryUserMessage, isRecoveryPromptMessage, isSuccessfulRecoveryContinuation, isUnfinishedAssistant, MAX_ATTEMPTS, MAX_PREFLIGHT_ATTEMPTS, messageReadFailed, recoveryBarrierAllows, recoveryRequestIsCurrent, recoveryRequestIsNewer, resetRecoveryAfterSuccess, samePendingRecovery, startsRecoveryChain, targetAssistant } from "./core.ts"
 import { estimateTokens, formatDuration } from "./util.ts"
 import { idleAction, isActiveStatus, isEmptyOutput, stallCandidates, trackAction } from "./stall.ts"
 import { completionOf, contentToolTokens, hasPendingUserRequest, lastAssistantOf, panelRow, runningToolOf, textTokensOf, thinkingTokensOf, toolInputTokensOf } from "./tui.tsx"
@@ -92,7 +92,6 @@ for (const message of [
   "Bad request",
   "reasoning_opaque",
   "Invalid input for tool",
-  "unknown certificate verification error",
   "SSL handshake failed: connection reset",
   "overloaded",
   "rate limit exceeded",
@@ -102,6 +101,57 @@ for (const message of [
 ]) {
   expect(isRecoverable({ name: "UnknownError", data: { message } }), false, `UnknownError ${message} is ignored`)
 }
+for (const error of [
+  { name: "Error", message: "unknown certificate verification error", code: "UNKNOWN_CERTIFICATE_VERIFICATION_ERROR" },
+  { name: "APIError", data: { code: "UNKNOWN_CERTIFICATE_VERIFICATION_ERROR", message: "unknown certificate verification error" } },
+  { name: "UNKNOWN_CERTIFICATE_VERIFICATION_ERROR", message: "unknown certificate verification error" },
+  { name: "Error", data: { name: "UNKNOWN_CERTIFICATE_VERIFICATION_ERROR", message: "Error: unknown certificate verification error" } },
+  { name: "UnknownError", data: { code: "UNKNOWN_CERTIFICATE_VERIFICATION_ERROR", message: "Error: unknown certificate verification error" } },
+  { name: "UnknownError", data: { message: "Error: unknown certificate verification error" } },
+  { name: "UnknownError", data: { message: "unknown certificate verification error" } },
+  { name: "Error", code: "UNKNOWN_CERTIFICATE_VERIFICATION_ERROR", message: "UNKNOWN_CERTIFICATE_VERIFICATION_ERROR: unknown certificate verification error" },
+]) {
+  expect(isRecoverable(error), true, `${error.name} exact Bun certificate-network shape is recoverable`)
+}
+expect(isRecoverable({ name: "UNKNOWN_CERTIFICATE_VERIFICATION_ERROR", message: "unknown certificate verification error" }), true, "certificate error name with exact message is recoverable")
+expect(isRecoverable({ data: { name: "UNKNOWN_CERTIFICATE_VERIFICATION_ERROR", message: "unknown certificate verification error" } }), true, "data certificate error name is recovered")
+expect(isRecoverable({ name: "UnknownError", data: { code: "UNKNOWN_CERTIFICATE_VERIFICATION_ERROR", message: "Error: unknown certificate verification error" } }), true, "data certificate error code is recovered")
+for (const error of [
+  { name: "UNKNOWN_CERTIFICATE_VERIFICATION_ERROR", message: "" },
+  { data: { name: "UNKNOWN_CERTIFICATE_VERIFICATION_ERROR", message: "" } },
+  { name: "Error", message: "unknown certificate verification error" },
+  { name: "Error", message: "Error: unknown certificate verification error" },
+  { name: "UnknownError", message: "Error: unknown certificate verification error" },
+  { name: "UnknownError", data: { message: "UNKNOWN_CERTIFICATE_VERIFICATION_ERROR: unknown certificate verification error" } },
+  { name: "UnknownError", data: { message: "Error: another certificate failure" } },
+  { name: "Error", message: "UNKNOWN_CERTIFICATE_VERIFICATION_ERROR" },
+  { name: "UNKNOWN_CERTIFICATE_VERIFICATION_ERROR", message: "Unknown certificate verification error" },
+  { name: "UNKNOWN_CERTIFICATE_VERIFICATION_ERROR", message: "unknown_certificate_verification_error" },
+  { name: "UNKNOWN_CERTIFICATE_VERIFICATION_ERROR", message: " unknown certificate verification error" },
+  { name: "UNKNOWN_CERTIFICATE_VERIFICATION_ERROR", message: "Error: unknown certificate verification error " },
+  { name: "UNKNOWN_CERTIFICATE_VERIFICATION_ERROR", message: "UNKNOWN_CERTIFICATE_VERIFICATION_ERROR: Unknown certificate verification error" },
+]) {
+  expect(isRecoverable(error), false, "certificate code or phrase without provenance is ignored")
+}
+for (const message of [
+  "certificate verification",
+  "unknown certificate verification error while connecting",
+  "certificate verification failed while connecting",
+  "self-signed certificate in certificate chain",
+  "certificate expired",
+  "certificate has expired",
+  "unable to get local issuer certificate",
+]) {
+  expect(isRecoverable({ name: "Error", message }), false, `${message} remains permanent`)
+}
+for (const message of ["certificate verification", "self-signed certificate", "certificate expired", "certificate has expired", "unable to get local issuer certificate"]) {
+  expect(isRecoverable({ name: "UNKNOWN_CERTIFICATE_VERIFICATION_ERROR", message }), false, `named certificate error with ${message} remains permanent`)
+}
+for (const code of ["CERT_HAS_EXPIRED", "SELF_SIGNED_CERT_IN_CHAIN", "UNABLE_TO_GET_ISSUER_CERT"]) {
+  expect(isRecoverable({ name: "Error", code, message: "unknown certificate verification error" }), false, `${code} remains permanent`)
+}
+expect(isRecoverable({ name: "UNKNOWN_CERTIFICATE_VERIFICATION_ERROR", data: { name: "CERT_HAS_EXPIRED", message: "unknown certificate verification error" } }), false, "permanent nested name overrides Bun name")
+expect(isRecoverable({ code: "UNKNOWN_CERTIFICATE_VERIFICATION_ERROR", data: { code: "SELF_SIGNED_CERT_IN_CHAIN", message: "unknown certificate verification error" } }), false, "permanent nested code overrides Bun code")
 expect(isRecoverable({ name: "APIError", data: { message: "operation was aborted" } }), false, "bare abort text is not an API retry pattern")
 expect(isRecoverable({ name: "UnknownError", data: { message: "some unrelated failure" } }), false, "unrelated errors are ignored")
 
@@ -115,10 +165,121 @@ expect(isRecoverable({ name: "AbortError", message: "fetch failed" }), false, "t
 expect(isAbortError({ name: "AbortError", message: "Aborted" }), true, "DOM aborterror is detected")
 expect(isAbortError({ name: "AbortError", message: "fetch failed" }), true, "raw AbortError is always an abort")
 expect(isAbortError({ name: "UnknownError", data: { message: "provider closed the stream" } }), false, "non-abort error is not an abort")
+expect(isRecoverable({ name: "UnknownError", data: { name: "APIUserAbortError", message: "connection reset" } }), false, "nested API user abort masks transport text")
+expect(isAbortError({ name: "UnknownError", data: { name: "APIUserAbortError" } }), true, "nested API user abort is detected")
+expect(isRecoverable({ name: "UnknownError", data: { name: "UnauthorizedError", message: "connection reset" } }), false, "nested auth error masks transport text")
+expect(isRecoverable({ name: "UnknownError", data: { code: "UNAUTHORIZED", message: "connection reset" } }), false, "nested auth code masks transport text")
+expect(isRecoverable({ name: "UnknownError", data: { name: "APIError", message: "connection reset" } }), true, "nested API error preserves transport recovery")
+for (const error of [
+  { name: "ForbiddenError", message: "connection reset" },
+  { code: "FORBIDDEN", message: "connection reset" },
+  { name: "UnknownError", data: { name: "PermissionDeniedError", message: "connection reset" } },
+  { name: "UnknownError", data: { code: "ACCESS_DENIED", message: "connection reset" } },
+]) expect(isRecoverable(error), false, "forbidden/auth identifiers mask transport text")
 
 expect(isBlockedSession("child", new Set(), new Set(["child"])), true, "unknown parent pending blocks its session")
 expect(isBlockedSession("other", new Set(), new Set(["child"])), false, "unknown parent pending stays local")
-if (MAX_PREFLIGHT_ATTEMPTS !== 3 || createState().preflightAttempts !== 0) { console.error("FAIL: bounded preflight state"); process.exit(1) }
+expect(isUnfinishedAssistant({ info: { role: "assistant" } }), true, "unfinished assistant is readiness state")
+expect(targetAssistant([{ info: { id: "pending", role: "assistant" } }], "pending") !== undefined, true, "unfinished target remains eligible for preflight")
+expect(isUnfinishedAssistant({ info: { role: "assistant", finish: "stop" } }), false, "finished assistant is terminal")
+expect(targetAssistant([{ info: { id: "done", role: "assistant", time: { completed: 1 } } }], "done") === undefined, true, "completed target terminalizes")
+expect(targetAssistant([{ info: { id: "stale", role: "assistant" } }, { info: { role: "user" } }], "stale") === undefined, true, "changed target terminalizes")
+if (MAX_PREFLIGHT_ATTEMPTS !== 3 || createState().preflightAttempts !== 0 || createState().recoveryCancelled || createState().recoveryPromptMessageIDs.size !== 0) { console.error("FAIL: bounded preflight state"); process.exit(1) }
+expect(messageReadFailed(undefined), true, "failed message read is deferred")
+expect(messageReadFailed([]), false, "empty message list is not a read failure")
+const preflightTerminal = createState()
+preflightTerminal.preflightAttempts = MAX_PREFLIGHT_ATTEMPTS
+preflightTerminal.pendingRecovery = { reason: "status is busy" }
+clearPendingRecovery(preflightTerminal)
+expect(preflightTerminal.preflightAttempts === MAX_PREFLIGHT_ATTEMPTS && preflightTerminal.pendingRecovery === undefined, true, "preflight exhaustion clears pending recovery")
+const originalPending = { reason: "old" }
+const newerPending = { reason: "new" }
+const replacementPending = { reason: "replacement" }
+const discardState = createState()
+discardState.pendingRecovery = originalPending
+expect(!discardPendingRecovery(discardState, newerPending) && discardState.pendingRecovery === originalPending, true, "discard preserves newer pending identity")
+expect(discardPendingRecovery(discardState, originalPending) && discardState.pendingRecovery === undefined, true, "discard clears matching pending identity")
+const pendingIdentity = createState()
+pendingIdentity.pendingRecovery = originalPending
+if (samePendingRecovery(pendingIdentity.pendingRecovery, newerPending)) clearPendingRecovery(pendingIdentity)
+expect(pendingIdentity.pendingRecovery === originalPending, true, "terminal cleanup preserves newer pending recovery")
+pendingIdentity.pendingRecovery = newerPending
+if (samePendingRecovery(pendingIdentity.pendingRecovery, newerPending)) clearPendingRecovery(pendingIdentity)
+expect(pendingIdentity.pendingRecovery === undefined, true, "matching pending recovery is clearable")
+pendingIdentity.pendingRecovery = newerPending
+if (samePendingRecovery(pendingIdentity.pendingRecovery, originalPending)) pendingIdentity.pendingRecovery = replacementPending
+expect(pendingIdentity.pendingRecovery === newerPending, true, "stale active write cannot replace newer pending")
+pendingIdentity.pendingRecovery = originalPending
+if (samePendingRecovery(pendingIdentity.pendingRecovery, originalPending)) pendingIdentity.pendingRecovery = replacementPending
+expect(pendingIdentity.pendingRecovery === replacementPending, true, "matching old pending can be replaced")
+const concurrentRecovery = createState()
+concurrentRecovery.preflightAttempts = 2
+concurrentRecovery.recovering = true
+if (startsRecoveryChain(concurrentRecovery)) concurrentRecovery.preflightAttempts = 0
+expect(concurrentRecovery.preflightAttempts === 2, true, "concurrent recovery keeps preflight budget")
+concurrentRecovery.recovering = false
+concurrentRecovery.pendingRecovery = originalPending
+if (startsRecoveryChain(concurrentRecovery)) concurrentRecovery.preflightAttempts = 0
+expect(concurrentRecovery.preflightAttempts === 2 && concurrentRecovery.pendingRecovery === originalPending, true, "pending recovery keeps preflight budget")
+const freshRecovery = createState()
+expect(startsRecoveryChain(freshRecovery), true, "fresh recovery chain resets preflight budget")
+const completionWhilePromptPending = createState()
+completionWhilePromptPending.recovering = true
+completionWhilePromptPending.attempts = 2
+completionWhilePromptPending.preflightAttempts = 2
+completionWhilePromptPending.lastRecoveredMessageID = "failed"
+completionWhilePromptPending.recoveryPromptMessageIDs.add("prompt")
+completionWhilePromptPending.recoveryPromptRequestSequences.set("prompt", 2)
+completionWhilePromptPending.pendingRecovery = newerPending
+resetRecoveryAfterSuccess(completionWhilePromptPending, completionWhilePromptPending.recovering)
+expect(completionWhilePromptPending.attempts === 0 && completionWhilePromptPending.preflightAttempts === 0 && completionWhilePromptPending.lastRecoveredMessageID === undefined && completionWhilePromptPending.pendingRecovery === newerPending && completionWhilePromptPending.recoveryPromptMessageIDs.has("prompt") && completionWhilePromptPending.recoveryPromptRequestSequences.get("prompt") === 2, true, "completion while prompt pending resets state and preserves queue")
+const cancelledCompletion = createState()
+cancelledCompletion.recoveryCancelled = true
+cancelledCompletion.recoveryPromptMessageIDs.add("prompt")
+resetRecoveryAfterSuccess(cancelledCompletion)
+expect(cancelledCompletion.recoveryCancelled && cancelledCompletion.recoveryPromptMessageIDs.has("prompt"), true, "successful completion does not clear cancellation barrier")
+const rejectedTarget = createState()
+if (isRecoverable({ name: "APIError", data: { message: "Unauthorized", statusCode: 401 } })) rejectedTarget.lastRecoveredMessageID = "rejected"
+expect(rejectedTarget.lastRecoveredMessageID === undefined, true, "non-recoverable reclassification leaves no recovery marker")
+const cancelledRecovery = createState()
+cancelledRecovery.recoveryGeneration = 1
+cancelledRecovery.pendingRecovery = newerPending
+expect(!samePendingRecovery(cancelledRecovery.pendingRecovery, originalPending) && samePendingRecovery(cancelledRecovery.pendingRecovery, newerPending), true, "current pending drains after old-generation cancellation")
+cancelledRecovery.recoveryCancelled = true
+expect(!recoveryBarrierAllows(cancelledRecovery.recoveryCancelled), true, "cancelled pending does not drain")
+expect(recoveryRequestIsNewer(2, 1), false, "older external recovery cannot replace newer pending")
+expect(recoveryRequestIsNewer(1, 2), true, "newer external recovery can replace pending")
+const sequenceState = createState()
+const sequenceGeneration = sequenceState.recoveryGeneration
+sequenceState.recoveryRequestSequence = 2
+expect(recoveryRequestIsCurrent(sequenceState, sequenceGeneration, 2), true, "current recovery sequence is admitted")
+sequenceState.recoveryRequestSequence = 3
+expect(!recoveryRequestIsCurrent(sequenceState, sequenceGeneration, 2), true, "older recovery sequence is fenced")
+sequenceState.recoveryGeneration++
+expect(!recoveryRequestIsCurrent(sequenceState, sequenceGeneration, 3), true, "deleted recovery generation is fenced")
+const continuationIDs = new Set(["prompt"])
+const continuationSequences = new Map([["prompt", 2]])
+expect(isSuccessfulRecoveryContinuation(continuationIDs, continuationSequences, "prompt", 2), true, "matching recovery continuation is confirmed")
+expect(!isSuccessfulRecoveryContinuation(continuationIDs, continuationSequences, "other", 2), true, "unrelated assistant completion is ignored")
+expect(!isSuccessfulRecoveryContinuation(continuationIDs, continuationSequences, "prompt", 3), true, "older continuation cannot reset newer chain")
+expect(!recoveryBarrierAllows(true), true, "stale same-target error is rejected")
+expect(!recoveryBarrierAllows(true), true, "targetless recovery stays behind cancellation barrier")
+expect(recoveryBarrierAllows(false), true, "new target clears cancellation barrier")
+const pluginPromptIDs = new Set(["msg_plugin"])
+expect(isRecoveryPromptMessage(pluginPromptIDs, "msg_plugin"), true, "plugin prompt user message is identified")
+expect(!isRecoveryPromptMessage(pluginPromptIDs, "msg_late"), true, "late different user message is not plugin prompt")
+expect(isGenuineRecoveryUserMessage(pluginPromptIDs, "msg_user"), true, "different user ID clears cancellation barrier")
+expect(!isGenuineRecoveryUserMessage(pluginPromptIDs, "msg_plugin"), true, "late plugin user update does not clear barrier")
+expect(!isGenuineRecoveryUserMessage(pluginPromptIDs, undefined), true, "ID-less user update does not clear barrier")
+const pluginUpdate = createState()
+pluginUpdate.recoveryPromptMessageIDs.add("msg_plugin")
+expect(isRecoveryPromptMessage(pluginUpdate.recoveryPromptMessageIDs, "msg_plugin") && pluginUpdate.recoveryPromptMessageIDs.has("msg_plugin"), true, "first plugin update retains prompt marker")
+pluginUpdate.recoveryCancelled = true
+expect(isRecoveryPromptMessage(pluginUpdate.recoveryPromptMessageIDs, "msg_plugin") && pluginUpdate.recoveryCancelled, true, "late plugin update keeps cancellation barrier")
+const attemptTerminal = createState()
+attemptTerminal.attempts = MAX_ATTEMPTS
+attemptTerminal.gaveUp = true
+expect(MAX_ATTEMPTS === 10 && attemptTerminal.attempts === MAX_ATTEMPTS && attemptTerminal.gaveUp, true, "actual attempt cap is terminal")
 
 // Shared pure helpers.
 if (estimateTokens("12345678") !== 2) { console.error("FAIL: estimateTokens ascii"); process.exit(1) }

@@ -28,11 +28,17 @@
   SSE 超时、`ETIMEDOUT`、broken pipe，以及 stream closed/ended 或 premature close
 
 恢复流程（按会话）：确认失败的 assistant 消息 → 捕获部分产出 → 保留完整历史并追加续写提示。
-护栏：用户主动停止、鉴权错误、永久性失败、模型/工具输出错误、TLS/证书错误、
-空输出及静默卡顿永不自动恢复；每会话最多连续恢复 10 次，指数退避上限 30 分钟
-（成功后计数归零）；模型/工具错误即使带有原本可重试的 API 状态码也会排除。
-状态预检最多等待 3 次，只等待失败消息就绪，不会扩大错误匹配范围；绝不干涉
-OpenCode 自带的重试循环。
+护栏：用户主动停止、鉴权错误、永久性失败、模型/工具输出错误、空输出及静默卡顿
+永不自动恢复。TLS/证书错误只有精确的 Bun 错误码并搭配精确的
+`unknown certificate verification error`、`Error: unknown certificate verification error`
+或完整的
+`UNKNOWN_CERTIFICATE_VERIFICATION_ERROR: unknown certificate verification error`
+文案时才可恢复。唯一无需错误码的例外是 OpenCode 精确的 `UnknownError` 封装，且
+`data.message` 必须为精确的裸文案 `unknown certificate verification error`（精确的
+`Error: unknown certificate verification error` 序列化形式也支持）。单独证书文案、单独错误码及其他证书错误均不恢复；每会话最多连续恢复 10 次，指数退避上限 30 分钟
+（仅确认续写成功后计数归零）；模型/工具错误即使带有原本可重试的 API 状态码也会排除。
+状态预检需同时等待失败消息就绪及会话状态探测为空闲，最多尝试 3 次；不会扩大
+错误匹配范围，绝不干涉 OpenCode 自带的重试循环。
 日志：`~/.local/share/opencode/logs/auto-recover.log`。
 
 ### 实时状态行
@@ -56,8 +62,9 @@ OpenCode 自带的重试循环。
 
 ### 通知弹窗
 
-仅限重试类事件：OpenCode 自带重试（`⚠️ Retrying · attempt 2`）与本插件
-自动恢复（`🔄 Auto-recovering · 1/10`）。所有展示均为只读，绝不改动会话状态。
+重试类事件：OpenCode 自带重试（`⚠️ Retrying · attempt 2`）与本插件自动恢复
+（`🔄 Auto-recovering · 1/10`）。恢复达到终止上限时还会显示
+`⛔ Auto-recovery stopped`。所有展示均为只读，绝不改动会话状态。
 
 ## 安装
 
