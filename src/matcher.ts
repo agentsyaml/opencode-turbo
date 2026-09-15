@@ -36,8 +36,6 @@ const CONNECTION_PATTERNS = [
   /\b(?:reset|closed|lost|terminated|aborted|ended)\s+(?:the\s+)?(?:connection|stream)\b/i,
   /\breset\s+by\s+peer\b/i,
   /\bunable\s+to\s+connect\b/i,
-  /\bcannot\s+connect\s+to\s+host\b/i,
-  /\bconnect\s+call\s+failed\b/i,
   /\beconn[a-z0-9_]*\b/i,
   /\bsocket\s+(?:hang\s+up|closed)\b/i,
   /\bnetwork\s+error\b/i,
@@ -88,6 +86,14 @@ const CERTIFICATE_PERMANENT_PATTERNS = [
   "tls",
   "ssl",
 ]
+
+// A bare upstream-connect failure (host down) is transient even when the
+// provider decorates it with an `ssl` context object; only genuine
+// certificate/handshake text keeps it permanent. This is checked after the
+// per-message permanent patterns so e.g. "cannot connect to host ... not found"
+// still wins as permanent.
+const UPSTREAM_CONNECT = /\b(?:cannot\s+connect\s+to\s+host|connect\s+call\s+failed)\b/i
+const CERTIFICATE_VERIFY = /certificate|self[ -]signed|issuer|verify|handshake/i
 
 function hasAny(text: string, patterns: readonly string[]): boolean {
   return patterns.some((pattern) => text.includes(pattern))
@@ -216,6 +222,7 @@ export function isRecoverable(error: unknown): boolean {
   if (isTransientCertificateNetworkError(name, identifiers, message, dataMessage)) return true
   if (hasExactCertificateIdentifier(identifiers)) return false
   if (normalizedName === "messageoutputlengtherror" || hasAny(match, PERMANENT_PATTERNS)) return false
+  if (UPSTREAM_CONNECT.test(match) && !CERTIFICATE_VERIFY.test(match)) return true
   if (hasAny(match, CERTIFICATE_PERMANENT_PATTERNS)) return false
 
   if (isAPIError) {

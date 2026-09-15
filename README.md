@@ -2,7 +2,8 @@
 
 Peace of mind for OpenCode. Long-running sessions can hit provider failures
 that OpenCode does not retry, while the live status line makes session activity
-visible. This plugin handles the explicit failure cases — zero config.
+visible. This plugin handles explicit failures plus silent stalls and empty
+turns — zero config required, all knobs optional.
 
 ## Why
 
@@ -35,14 +36,21 @@ a matching API, SQL, or connection/transport failure:
   connect, `cannot connect to host` / `connect call failed`, socket hang up,
   fetch failure, request/connection/response/read/SSE timeouts, `ETIMEDOUT`,
   broken pipe, and stream closed/ended or premature close
-- a bare provider timeout, accepted only as the exact sentence
-  `the operation timed out.` from an unclassified error; the tool-timeout
-  variant carrying the larger-timeout hint stays excluded
+- a bare provider timeout, accepted as the bare sentence
+  `the operation timed out` with or without a trailing period, from an
+  unclassified error; the tool-timeout variant carrying the larger-timeout
+  hint stays excluded
+- silent stalls: a session that makes no stream progress for `stallTimeoutMs`
+  (default 30 min) with no running tool is probed and, only when the session is
+  idle, resumed through the same recovery path; a busy session is probed under
+  the preflight budget and never aborted
+- empty turns: a turn that finishes with no visible text or tool output is
+  continued with a short prompt asking for the actual answer
 
 Recovery per session: verify the failed assistant message → capture the partial
 output → append a continuation prompt while retaining the full history. Guardrails:
-user stops, auth errors, permanent failures, model/tool output errors,
-empty output, and silent stalls are never recovered. TLS/certificate errors are
+user stops, auth errors, permanent failures, and model/tool output errors are
+never recovered. TLS/certificate errors are
 never recovered except for the exact Bun code paired with one of the exact
 messages `unknown certificate verification error`,
 `Error: unknown certificate verification error`, or full
@@ -55,12 +63,18 @@ Bare certificate phrases, bare codes, and other certificate errors do not
 recover.
 model/tool errors stay excluded even when an API status code would otherwise be
 retryable. Status preflight probes wait for both the failed message to be ready
-and the session status probe to be idle, with at most three attempts; they do
-not widen the error matcher.
+and the session status probe to be idle, retrying for up to 10 minutes with
+exponential backoff capped at 30s before giving up visibly; they do not widen
+the error matcher.
 at most 10 consecutive recoveries with exponential backoff capped at 30 minutes
 (counter resets only after a confirmed recovery continuation succeeds); OpenCode's
 own retry loop is never touched. Logs:
 `~/.local/share/opencode/logs/auto-recover.log`.
+
+A user abort (Esc) permanently cancels the chain for that session: the plugin
+never auto-retries a user abort and never auto-aborts a busy session, and never
+revives a cancelled chain on its own. The barrier clears only when the next
+genuine user message arrives, after which later failures can recover again.
 
 ### Live status line
 
@@ -105,7 +119,21 @@ Local development — point at the source:
 }
 ```
 
-No configuration. Restart OpenCode after changing config.
+Optional configuration — pass options as the second plugin tuple element:
+
+```json
+{
+  "plugin": [
+    ["@alexsun-top/opencode-turbo", { "stallTimeoutMs": 1800000, "emptyOutput": true }]
+  ]
+}
+```
+
+- `stallTimeoutMs` (default `1800000`, 30 min): event silence before the
+  watchdog treats a session as stalled; `0` disables the watchdog.
+- `emptyOutput` (default `true`): recover a turn that finished with no output.
+
+Restart OpenCode after changing config.
 
 > The TUI status line is served from `dist/tui.js`. After editing `src/tui.tsx`,
 > run `bun run build:tui` — otherwise the sidebar line silently won't load.

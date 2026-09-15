@@ -125,6 +125,177 @@ export function stallCandidates(activity: ReadonlyMap<string, number>, now: numb
   return stalled
 }
 
+// ── Stall watchdog state machine ────────────────────────────────────────────
+//
+// A silent SSE stall produces no events and therefore no error, so the only
+// signal is elapsed time. The watch records the last stream-progress instant
+// per session using a monotonic clock (so sleep/wake cannot fake a stall) and
+// exposes sweep() for a periodic timer to call. It never acts on its own: the
+// entry wires sweep() into recover(), whose status preflight refuses to prompt
+// a busy session. A long-running tool is legitimate waiting, never a stall.
+
+export type PartActivity = "stream" | "progress" | "tool-wait" | "ignore"
+
+export function partActivity(part: unknown): PartActivity {
+  if (typeof part !== "object" || part === null) return "ignore"
+  const p = part as Record<string, unknown>
+  if (p.type === "text" || p.type === "reasoning") return "stream"
+  if (p.type !== "tool") return "ignore"
+  const status = stringField(p.state, "status")
+  if (status === "completed" || status === "error") return "progress"
+  if (status === "running" || status === "pending") return "tool-wait"
+  return "ignore"
+}
+
+export function lastPartIsRunningTool(parts: unknown): boolean {
+  if (!Array.isArray(parts) || parts.length === 0) return false
+  return partActivity(parts[parts.length - 1]) === "tool-wait"
+}
+
+function stringField(value: unknown, key: string): string | undefined {
+  if (typeof value !== "object" || value === null) return undefined
+  const field = (value as Record<string, unknown>)[key]
+  return typeof field === "string" ? field : undefined
+}
+
+export interface StallSnapshot {
+  lastStreamActivity: number
+  lastPartIsRunningTool: boolean
+  lastMessageID?: string
+}
+
+/** Pure eligibility gate. The caller supplies session/state facts. */
+export function stallEligible(input: {
+  now: number
+  lastStreamActivity: number
+  timeoutMs: number
+  lastPartIsRunningTool: boolean
+  blocked: boolean
+  recovering: boolean
+  pendingRecovery: boolean
+  gaveUp: boolean
+  recoveryCancelled: boolean
+  deleted: boolean
+  known: boolean
+  lastRecoveredMessageID?: string
+  stalledMessageID?: string
+}): boolean {
+  if (input.lastPartIsRunningTool) return false
+  if (input.blocked || input.recovering || input.pendingRecovery || input.gaveUp || input.recoveryCancelled) return false
+  if (input.deleted || !input.known) return false
+  if (input.stalledMessageID !== undefined && input.lastRecoveredMessageID === input.stalledMessageID) return false
+  return input.now - input.lastStreamActivity > input.timeoutMs
+}
+
+export interface StallWatch {
+  readonly enabled: boolean
+  note(type: string, props: unknown): void
+  sweep(now: number): string[]
+  forget(id: string): void
+  snapshot(id: string): StallSnapshot | undefined
+  dispose(): void
+}
+
+export interface StallWatchOptions {
+  timeoutMs: number
+  checkMs: number
+  maxPerSweep: number
+  now?: () => number
+  log?: (message: string) => void
+  eligible?: (id: string, now: number, snapshot: StallSnapshot) => boolean
+}
+
+interface WatchEntry extends StallSnapshot {
+  toolWaitLogged: boolean
+}
+
+export function createStallWatch(options: StallWatchOptions): StallWatch {
+  const enabled = options.timeoutMs > 0
+  const clock = options.now ?? (() => performance.now())
+  const entries = new Map<string, WatchEntry>()
+
+  function entry(id: string): WatchEntry {
+    let value = entries.get(id)
+    if (!value) {
+      value = { lastStreamActivity: clock(), lastPartIsRunningTool: false, toolWaitLogged: false }
+      entries.set(id, value)
+    }
+    return value
+  }
+  function touchStream(id: string): void {
+    const value = entry(id)
+    value.lastStreamActivity = clock()
+    value.lastPartIsRunningTool = false
+    value.toolWaitLogged = false
+  }
+  function note(type: string, props: unknown): void {
+    if (!enabled) return
+    const track = trackAction(type, props)
+    if (track.action === "ignore" || track.action === "pause") return
+    if (track.action === "clear") {
+      entries.delete(track.sessionID)
+      return
+    }
+    if (track.action === "resume") {
+      touchStream(track.sessionID)
+      return
+    }
+    const id = track.sessionID
+    if (type === "message.part.updated") {
+      const part = objectField(props, "part")
+      const activity = partActivity(part)
+      if (activity === "ignore") return
+      const value = entry(id)
+      if (part && typeof part.messageID === "string") value.lastMessageID = part.messageID
+      if (activity === "tool-wait") {
+        value.lastPartIsRunningTool = true
+        return
+      }
+      touchStream(id)
+      return
+    }
+    if (type === "message.updated") {
+      const info = objectField(props, "info")
+      const value = entry(id)
+      if (info && typeof info.id === "string") value.lastMessageID = info.id
+      touchStream(id)
+      return
+    }
+    touchStream(id)
+  }
+  function snapshot(id: string): StallSnapshot | undefined {
+    const value = entries.get(id)
+    return value ? { lastStreamActivity: value.lastStreamActivity, lastPartIsRunningTool: value.lastPartIsRunningTool, lastMessageID: value.lastMessageID } : undefined
+  }
+  function sweep(now: number): string[] {
+    if (!enabled) return []
+    const stale: string[] = []
+    for (const [id, value] of entries) {
+      if (stale.length >= options.maxPerSweep) break
+      if (now - value.lastStreamActivity <= options.timeoutMs) continue
+      if (value.lastPartIsRunningTool) {
+        if (!value.toolWaitLogged) {
+          value.toolWaitLogged = true
+          options.log?.(`STALL_TOOL_WAIT ${id}`)
+        }
+        continue
+      }
+      const snap: StallSnapshot = { lastStreamActivity: value.lastStreamActivity, lastPartIsRunningTool: value.lastPartIsRunningTool, lastMessageID: value.lastMessageID }
+      if (options.eligible && !options.eligible(id, now, snap)) continue
+      stale.push(id)
+    }
+    return stale
+  }
+  function forget(id: string): void {
+    entries.delete(id)
+  }
+  function dispose(): void {
+    entries.clear()
+  }
+  return { enabled, note, sweep, forget, snapshot, dispose }
+}
+
+
 // ── Empty-output detection ───────────────────────────────────────────────────
 
 interface EmptyMsg {

@@ -1,7 +1,8 @@
 # opencode-turbo
 
 让 OpenCode 安心运行。长会话可能遇到 OpenCode 默认不重试的提供方错误，
-而侧边栏实时状态行让会话活动清晰可见。本插件处理明确的失败场景——零配置。
+而侧边栏实时状态行让会话活动清晰可见。本插件处理明确失败，以及静默卡顿与
+空输出回合——零配置可用，所有参数可选。
 
 ## 为什么能降低焦虑
 
@@ -28,12 +29,16 @@
   `cannot connect to host` / `connect call failed`、socket hang up、fetch 失败、
   request/connection/response/read/SSE 超时、`ETIMEDOUT`、broken pipe，
   以及 stream closed/ended 或 premature close
-- 仅接受未分类错误中精确为 `the operation timed out.` 的裸提供方超时文案；
+- 接受未分类错误中的裸文案 `the operation timed out`（结尾句点可有可无）；
   带更大超时提示的工具超时变体仍不处理
+- 静默卡顿：会话在 `stallTimeoutMs`（默认 30 分钟）内没有任何流式进展且无正在
+  运行的工具时先做探测；仅在会话空闲时通过同一恢复路径续写，忙碌会话只做预检，
+  绝不中止
+- 空输出回合：回合结束但没有可见文本或工具输出时，发送简短提示要求给出实际答案
 
 恢复流程（按会话）：确认失败的 assistant 消息 → 捕获部分产出 → 保留完整历史并追加续写提示。
-护栏：用户主动停止、鉴权错误、永久性失败、模型/工具输出错误、空输出及静默卡顿
-永不自动恢复。TLS/证书错误只有精确的 Bun 错误码并搭配精确的
+护栏：用户主动停止、鉴权错误、永久性失败、模型/工具输出错误绝不自动恢复。
+TLS/证书错误只有精确的 Bun 错误码并搭配精确的
 `unknown certificate verification error`、`Error: unknown certificate verification error`
 或完整的
 `UNKNOWN_CERTIFICATE_VERIFICATION_ERROR: unknown certificate verification error`
@@ -41,9 +46,13 @@
 `data.message` 必须为精确的裸文案 `unknown certificate verification error`（精确的
 `Error: unknown certificate verification error` 序列化形式也支持）。单独证书文案、单独错误码及其他证书错误均不恢复；每会话最多连续恢复 10 次，指数退避上限 30 分钟
 （仅确认续写成功后计数归零）；模型/工具错误即使带有原本可重试的 API 状态码也会排除。
-状态预检需同时等待失败消息就绪及会话状态探测为空闲，最多尝试 3 次；不会扩大
-错误匹配范围，绝不干涉 OpenCode 自带的重试循环。
+状态预检需同时等待失败消息就绪及会话状态探测为空闲，最长重试 10 分钟（指数退避
+上限 30 秒）后可见地放弃；不会扩大错误匹配范围，绝不干涉 OpenCode 自带的重试循环。
 日志：`~/.local/share/opencode/logs/auto-recover.log`。
+
+用户主动中止（Esc）会永久取消该会话的恢复链：插件绝不重试用户中止，也绝不主动
+中止忙碌会话，更不会自行复活已取消的链。只有下一条真实用户消息到来才会清除屏障，
+此后的失败才可再次恢复。
 
 ### 实时状态行
 
@@ -86,7 +95,21 @@
 }
 ```
 
-无任何配置。修改配置后重启 OpenCode。
+可选配置——以插件二元组的第二项传入：
+
+```json
+{
+  "plugin": [
+    ["@alexsun-top/opencode-turbo", { "stallTimeoutMs": 1800000, "emptyOutput": true }]
+  ]
+}
+```
+
+- `stallTimeoutMs`（默认 `1800000`，即 30 分钟）：判定为卡顿前的静默时长；
+  `0` 关闭看门狗。
+- `emptyOutput`（默认 `true`）：恢复没有输出的回合。
+
+修改配置后重启 OpenCode。
 
 > TUI 状态行由 `dist/tui.js` 提供。修改 `src/tui.tsx` 后需执行
 > `bun run build:tui`，否则侧边栏状态行不会加载。

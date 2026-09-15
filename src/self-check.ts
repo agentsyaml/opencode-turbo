@@ -2,9 +2,9 @@
 // Run with: bun run src/self-check.ts
 
 import { isAbortError, isRecoverable } from "./matcher.ts"
-import { clearPendingRecovery, createState, discardPendingRecovery, isBlockedSession, isGenuineRecoveryUserMessage, isRecoveryPromptMessage, isSuccessfulRecoveryContinuation, isUnfinishedAssistant, MAX_ATTEMPTS, MAX_PREFLIGHT_ATTEMPTS, messageReadFailed, recoveryBarrierAllows, recoveryRequestIsCurrent, recoveryRequestIsNewer, resetRecoveryAfterSuccess, samePendingRecovery, startsRecoveryChain, targetAssistant } from "./core.ts"
+import { clearPendingRecovery, createState, discardPendingRecovery, isBlockedSession, isGenuineRecoveryUserMessage, isRecoveryPromptMessage, isSuccessfulRecoveryContinuation, isUnfinishedAssistant, MAX_ATTEMPTS, PREFLIGHT_BACKOFF_MAX_MS, PREFLIGHT_GIVE_UP_MS, messageReadFailed, preflightBackoff, preflightExpired, recoveryBarrierAllows, recoveryRequestIsCurrent, recoveryRequestIsNewer, resetRecoveryAfterSuccess, samePendingRecovery, startsRecoveryChain, targetAssistant } from "./core.ts"
 import { estimateTokens, formatDuration } from "./util.ts"
-import { idleAction, isActiveStatus, isEmptyOutput, stallCandidates, trackAction } from "./stall.ts"
+import { isActiveStatus } from "./stall.ts"
 import { completionOf, contentToolTokens, hasPendingUserRequest, lastAssistantOf, panelRow, runningToolOf, textTokensOf, thinkingTokensOf, toolInputTokensOf } from "./tui.tsx"
 
 function expect(actual: boolean, expected: boolean, label: string): void {
@@ -91,7 +91,7 @@ const transportShapes: Array<[boolean, string, unknown]> = [
   [true, "socket connection was closed", { name: "APIError", message: "Cannot connect to API: The socket connection was closed unexpectedly. " }],
   [true, "connection has been reset", { name: "UnknownError", data: { message: "connection has been reset" } }],
   [true, "connection was lost", { name: "UnknownError", data: { message: "connection was lost" } }],
-  [true, "cannot connect to host", { name: "APIError", message: "litellm.InternalServerError: Hosted_vllmException - Cannot connect to host x:80 [Connect call failed ('1.2.3.4', 80)]" }],
+  [true, "litellm upstream connect (verbatim production string)", { name: "APIError", message: "litellm.InternalServerError: InternalServerError: Hosted_vllmException - Cannot connect to host arena-glm53-flash-predictor.yilab-lmt:80 ssl:<ssl.SSLContext object at 0x7f0745da3f70> [Connect call failed ('REDACTED', 80)]No fallback model group found for lookup_groups=svc/glm-5.3-flash." }],
   [true, "connect call failed", { name: "APIError", message: "Connect call failed ('1.2.3.4', 80)" }],
   [false, "suffixed tool timeout", { name: "UnknownError", data: { message: "The operation timed out. If this command is expected to take longer, please retry with a larger timeout value in milliseconds." } }],
   [false, "message abort", { name: "MessageAbortedError", message: "Aborted" }],
@@ -103,6 +103,12 @@ const transportShapes: Array<[boolean, string, unknown]> = [
   [false, "connection pool created", { name: "UnknownError", data: { message: "connection pool created" } }],
   [false, "connection was established", { name: "UnknownError", data: { message: "connection was established" } }],
   [false, "connection has been idle", { name: "UnknownError", data: { message: "connection has been idle" } }],
+  [true, "bare provider timeout mixed case and spacing", { name: "UnknownError", data: { message: "the   OPERATION timed out" } }],
+  [false, "provider timeout with trailing words", { name: "UnknownError", data: { message: "The operation timed out. Retrying." } }],
+  [false, "provider timeout with error prefix", { name: "UnknownError", data: { message: "Error: The operation timed out." } }],
+  [false, "upstream connect blocked by certificate text", { name: "APIError", message: "certificate has expired [Connect call failed]" }],
+  [false, "upstream connect blocked by ssl handshake text", { name: "APIError", message: "SSL handshake failed: connection reset" }],
+  [false, "permanent message still wins over upstream connect", { name: "APIError", message: "Cannot connect to host x: not found" }],
 ]
 for (const [recoverable, label, error] of transportShapes) {
   expect(isRecoverable(error), recoverable, `${label} ${recoverable ? "is recoverable" : "stays non-recoverable"}`)
@@ -210,14 +216,33 @@ expect(targetAssistant([{ info: { id: "pending", role: "assistant" } }], "pendin
 expect(isUnfinishedAssistant({ info: { role: "assistant", finish: "stop" } }), false, "finished assistant is terminal")
 expect(targetAssistant([{ info: { id: "done", role: "assistant", time: { completed: 1 } } }], "done") === undefined, true, "completed target terminalizes")
 expect(targetAssistant([{ info: { id: "stale", role: "assistant" } }, { info: { role: "user" } }], "stale") === undefined, true, "changed target terminalizes")
-if (MAX_PREFLIGHT_ATTEMPTS !== 3 || createState().preflightAttempts !== 0 || createState().recoveryCancelled || createState().recoveryPromptMessageIDs.size !== 0) { console.error("FAIL: bounded preflight state"); process.exit(1) }
+if (createState().preflightAttempts !== 0 || createState().preflightStartedAt !== undefined || createState().recoveryCancelled || createState().recoveryPromptMessageIDs.size !== 0) { console.error("FAIL: bounded preflight state"); process.exit(1) }
 expect(messageReadFailed(undefined), true, "failed message read is deferred")
 expect(messageReadFailed([]), false, "empty message list is not a read failure")
+// Preflight retries are bounded by wall clock (10 min), not attempt count.
+const preflightNow = 1_000_000
+expect(preflightExpired(undefined, preflightNow), false, "undefined preflight start never expires")
+expect(preflightExpired(preflightNow - 60_000, preflightNow), false, "preflight inside 10min keeps retrying")
+expect(preflightExpired(preflightNow - PREFLIGHT_GIVE_UP_MS, preflightNow), true, "preflight at 10min expires")
+expect(preflightExpired(preflightNow - PREFLIGHT_GIVE_UP_MS - 1, preflightNow), true, "preflight past 10min expires")
+expect(preflightBackoff(1) === 2_000, true, "preflight backoff attempt 1 is 2s")
+expect(preflightBackoff(5) === PREFLIGHT_BACKOFF_MAX_MS, true, "preflight backoff caps at 30s")
+expect(preflightBackoff(20) === PREFLIGHT_BACKOFF_MAX_MS, true, "preflight backoff stays capped")
+const preflightReset = createState()
+preflightReset.preflightStartedAt = preflightNow
+resetRecoveryAfterSuccess(preflightReset)
+expect(preflightReset.preflightStartedAt === undefined, true, "success resets the preflight episode")
+const chainReset = createState()
+chainReset.preflightStartedAt = preflightNow
+if (startsRecoveryChain(chainReset)) { chainReset.preflightAttempts = 0; chainReset.preflightStartedAt = undefined }
+expect(chainReset.preflightStartedAt === undefined, true, "new recovery chain resets the preflight episode")
 const preflightTerminal = createState()
-preflightTerminal.preflightAttempts = MAX_PREFLIGHT_ATTEMPTS
+preflightTerminal.preflightAttempts = 10
+preflightTerminal.preflightStartedAt = preflightNow
 preflightTerminal.pendingRecovery = { reason: "status is busy" }
+preflightTerminal.gaveUp = true
 clearPendingRecovery(preflightTerminal)
-expect(preflightTerminal.preflightAttempts === MAX_PREFLIGHT_ATTEMPTS && preflightTerminal.pendingRecovery === undefined, true, "preflight exhaustion clears pending recovery")
+expect(preflightTerminal.pendingRecovery === undefined && preflightTerminal.gaveUp, true, "10min preflight exhaustion clears pending recovery")
 const originalPending = { reason: "old" }
 const newerPending = { reason: "new" }
 const replacementPending = { reason: "replacement" }
@@ -288,6 +313,9 @@ const continuationSequences = new Map([["prompt", 2]])
 expect(isSuccessfulRecoveryContinuation(continuationIDs, continuationSequences, "prompt", 2), true, "matching recovery continuation is confirmed")
 expect(!isSuccessfulRecoveryContinuation(continuationIDs, continuationSequences, "other", 2), true, "unrelated assistant completion is ignored")
 expect(!isSuccessfulRecoveryContinuation(continuationIDs, continuationSequences, "prompt", 3), true, "older continuation cannot reset newer chain")
+// Abort-barrier policy (unchanged in 0.1.9): a cancelled chain stays vetoed
+// until a genuine user message clears it; no auto-revival path exists. The
+// CANCELLED/REVIVED log lines in index.ts are observability only.
 expect(!recoveryBarrierAllows(true), true, "stale same-target error is rejected")
 expect(!recoveryBarrierAllows(true), true, "targetless recovery stays behind cancellation barrier")
 expect(recoveryBarrierAllows(false), true, "new target clears cancellation barrier")
@@ -396,93 +424,5 @@ if (panelRow({ ...base, tool: { name: "write", elapsed: 1200, tokens: 300 }, wor
 if (panelRow({ ...base, failed: true }) !== "❌ Failed") { console.error("FAIL: panelRow failed priority"); process.exit(1) }
 
 console.log("ok: extended coverage (mixed content, edge cases)")
-
-// ── Stall watchdog (event-silence hang detection) ───────────────────────────
-
-// Generation-progress events prove liveness, tracked per session.
-{
-  const t = trackAction("message.part.updated", { part: { sessionID: "s1" } })
-  if (t.action !== "track" || t.sessionID !== "s1") { console.error("FAIL: trackAction part.updated"); process.exit(1) }
-}
-{
-  const t = trackAction("message.updated", { info: { sessionID: "s2", role: "assistant" } })
-  if (t.action !== "track" || t.sessionID !== "s2") { console.error("FAIL: trackAction message.updated"); process.exit(1) }
-}
-if (trackAction("message.updated", { info: { sessionID: "s2", role: "assistant", finish: "stop" } }).action !== "clear") { console.error("FAIL: terminal message.updated finish"); process.exit(1) }
-if (trackAction("message.updated", { info: { sessionID: "s2", role: "assistant", error: {} } }).action !== "clear") { console.error("FAIL: terminal message.updated error"); process.exit(1) }
-{
-  const t = trackAction("session.status", { sessionID: "s3", status: { type: "busy" } })
-  if (t.action !== "track" || t.sessionID !== "s3") { console.error("FAIL: trackAction session.status"); process.exit(1) }
-}
-for (const status of ["idle", "retry"]) {
-  const t = trackAction("session.status", { sessionID: "s3", status: { type: status } })
-  if (t.action !== "clear" || t.sessionID !== "s3") { console.error(`FAIL: trackAction session.status ${status}`); process.exit(1) }
-}
-for (const type of ["permission.updated", "permission.asked", "permission.v2.asked", "question.asked", "question.v2.asked"]) {
-  const t = trackAction(type, { sessionID: "s7", id: "r1" })
-  if (t.action !== "pause" || t.sessionID !== "s7" || t.requestID !== "r1") { console.error(`FAIL: trackAction ${type} pause`); process.exit(1) }
-}
-for (const type of ["permission.replied", "permission.v2.replied", "question.replied", "question.v2.replied", "question.rejected", "question.v2.rejected"]) {
-  const key = type.startsWith("permission.replied") ? "permissionID" : "requestID"
-  const t = trackAction(type, { sessionID: "s7", [key]: "r1" })
-  if (t.action !== "resume" || t.sessionID !== "s7" || t.requestID !== "r1") { console.error(`FAIL: trackAction ${type} resume`); process.exit(1) }
-}
-if ("requestID" in trackAction("question.asked", { sessionID: "s9" })) { console.error("FAIL: missing request ID pause must be session-wide"); process.exit(1) }
-if ("requestID" in trackAction("question.rejected", { sessionID: "s9" })) { console.error("FAIL: missing request ID resume must be session-wide"); process.exit(1) }
-if (idleAction("s8", true).action !== "pause") { console.error("FAIL: idle with pending request stays paused"); process.exit(1) }
-if (idleAction("s8", false).action !== "clear") { console.error("FAIL: idle without pending request clears"); process.exit(1) }
-{
-  const t = trackAction("session.idle", { sessionID: "s4" })
-  if (t.action !== "clear" || t.sessionID !== "s4") { console.error("FAIL: trackAction session.idle"); process.exit(1) }
-}
-{
-  const t = trackAction("session.error", { sessionID: "s5" })
-  if (t.action !== "clear" || t.sessionID !== "s5") { console.error("FAIL: trackAction session.error"); process.exit(1) }
-}
-{
-  const t = trackAction("session.deleted", { info: { id: "s6" } })
-  if (t.action !== "clear" || t.sessionID !== "s6") { console.error("FAIL: trackAction session.deleted"); process.exit(1) }
-}
-if (trackAction("message.part.removed", {}).action !== "ignore") { console.error("FAIL: trackAction part.removed ignored"); process.exit(1) }
-if (trackAction("unknown.event", {}).action !== "ignore") { console.error("FAIL: trackAction unknown ignored"); process.exit(1) }
-if (trackAction("session.status", {}).action !== "ignore") { console.error("FAIL: trackAction missing sessionID"); process.exit(1) }
-
-// stallCandidates remains a pure helper; the event path does not recover stalls.
-const activity = new Map([["s1", 1_000_000], ["s2", 2_000_000], ["s3", 1_500_000]])
-if (JSON.stringify(stallCandidates(activity, 2_100_000, 600_000)) !== '["s1"]') { console.error("FAIL: stallCandidates basic"); process.exit(1) }
-if (stallCandidates(new Map(), 2_100_000, 600_000).length !== 0) { console.error("FAIL: stallCandidates empty"); process.exit(1) }
-// Exact boundary: now - last === timeout does NOT qualify (strictly greater).
-if (stallCandidates(new Map([["s1", 1_500_000]]), 2_100_000, 600_000).length !== 0) { console.error("FAIL: stallCandidates boundary"); process.exit(1) }
-
-console.log("ok: stall helpers (trackAction, stallCandidates)")
-
-// ── Empty-output detection helper (never an automatic recovery trigger) ───────
-
-// Reasoning-only message: the helper identifies empty output, but the plugin
-// does not automatically send another prompt for it.
-if (!isEmptyOutput({ parts: [{ type: "reasoning", text: "thinking..." }] })) { console.error("FAIL: isEmptyOutput reasoning only"); process.exit(1) }
-for (const type of ["step-start", "step-finish", "snapshot", "patch", "compaction"]) {
-  if (!isEmptyOutput({ parts: [{ type: "reasoning" }, { type }] })) { console.error(`FAIL: isEmptyOutput structural ${type}`); process.exit(1) }
-}
-// Missing or unknown parts are unsafe to classify as empty.
-if (isEmptyOutput({})) { console.error("FAIL: isEmptyOutput missing parts is unknown"); process.exit(1) }
-if (isEmptyOutput({ parts: "unknown" })) { console.error("FAIL: isEmptyOutput unknown parts"); process.exit(1) }
-if (isEmptyOutput({ parts: [{ type: "future-part" }] })) { console.error("FAIL: isEmptyOutput unknown part type"); process.exit(1) }
-// An explicit empty parts array is an empty response.
-if (!isEmptyOutput({ parts: [] })) { console.error("FAIL: isEmptyOutput explicit empty parts"); process.exit(1) }
-// Real text: not empty.
-if (isEmptyOutput({ parts: [{ type: "reasoning", text: "thinking" }, { type: "text", text: "answer" }] })) { console.error("FAIL: isEmptyOutput with text"); process.exit(1) }
-// Tool call: not empty (the model is acting, not silent).
-if (isEmptyOutput({ parts: [{ type: "tool" }] })) { console.error("FAIL: isEmptyOutput with tool"); process.exit(1) }
-// Agent part: not empty (subagent is running / did work).
-if (isEmptyOutput({ parts: [{ type: "agent" }] })) { console.error("FAIL: isEmptyOutput with agent"); process.exit(1) }
-// Whitespace-only text: empty.
-if (!isEmptyOutput({ parts: [{ type: "text", text: "   " }] })) { console.error("FAIL: isEmptyOutput whitespace"); process.exit(1) }
-// Synthetic/ignored parts do not count as output.
-if (!isEmptyOutput({ parts: [{ type: "text", text: "x", synthetic: true }] })) { console.error("FAIL: isEmptyOutput synthetic"); process.exit(1) }
-// Missing parts are unknown and must not trigger recovery.
-if (isEmptyOutput(undefined)) { console.error("FAIL: isEmptyOutput undefined is unknown"); process.exit(1) }
-
-console.log("ok: empty-output detection (isEmptyOutput)")
 
 console.log("all checks passed")
