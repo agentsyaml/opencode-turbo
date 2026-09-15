@@ -32,11 +32,12 @@ const API_TRANSIENT_MESSAGES = [
 // APIError. Keep these patterns specific: model/tool text and vague stream
 // state descriptions must not start a new prompt.
 const CONNECTION_PATTERNS = [
-  /\bconnection\s+(?:reset|closed|lost|terminated|aborted|ended)\b/i,
-  /\bconnection\s+refused\b/i,
+  /\bconnection\s+(?:(?:is|was|were|has|have|had|been|being|get|gets|got)\s+)*(?:reset|closed|lost|terminated|aborted|ended|refused)\b/i,
   /\b(?:reset|closed|lost|terminated|aborted|ended)\s+(?:the\s+)?(?:connection|stream)\b/i,
   /\breset\s+by\s+peer\b/i,
   /\bunable\s+to\s+connect\b/i,
+  /\bcannot\s+connect\s+to\s+host\b/i,
+  /\bconnect\s+call\s+failed\b/i,
   /\beconn[a-z0-9_]*\b/i,
   /\bsocket\s+(?:hang\s+up|closed)\b/i,
   /\bnetwork\s+error\b/i,
@@ -114,6 +115,17 @@ function hasPermanentIdentifier(identifiers: readonly string[]): boolean {
 
 function isConnectionError(text: string): boolean {
   return CONNECTION_PATTERNS.some((pattern) => pattern.test(text))
+}
+
+// A bare provider request/stream deadline has no status code and no transport
+// noun. Accept only the exact sentence (optionally with a trailing dot); the
+// tool-timeout variant carries a hint about a larger timeout and must stay out.
+const OPERATION_TIMEOUT = /^the operation timed out\.?$/
+const TOOL_TIMEOUT_HINT = "if this command is expected to take longer"
+
+function isOperationTimeout(message: string): boolean {
+  const text = message.trim().replace(/\s+/g, " ")
+  return OPERATION_TIMEOUT.test(text) && !text.includes(TOOL_TIMEOUT_HINT)
 }
 
 function isSqlFailure(message: string): boolean {
@@ -214,7 +226,7 @@ export function isRecoverable(error: unknown): boolean {
   if (isFailedQuery(messageText)) return true
   if (SQL_ERROR_NAMES.test(name)) return isSqlFailure(messageText)
 
-  return isConnectionError(match)
+  return isConnectionError(match) || isOperationTimeout(messageText)
 }
 
 /** User-initiated aborts are deliberate stops, not failures. */

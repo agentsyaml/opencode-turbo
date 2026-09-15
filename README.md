@@ -30,10 +30,14 @@ a matching API, SQL, or connection/transport failure:
   statement` or `database is locked`; `Failed query:` is accepted without an
   error class only when it is immediately followed by a SQL statement keyword
   such as `insert`, `select`, or `update`
-- narrow connection/transport failures such as connection reset/closed/lost,
-  `ECONN*`, unable to connect, socket hang up, fetch failure, request/connection/
-  response/read/SSE timeouts, `ETIMEDOUT`, broken pipe, and stream
-  closed/ended or premature close
+- narrow connection/transport failures such as connection reset/closed/lost
+  (including auxiliary forms like `connection was closed`), `ECONN*`, unable to
+  connect, `cannot connect to host` / `connect call failed`, socket hang up,
+  fetch failure, request/connection/response/read/SSE timeouts, `ETIMEDOUT`,
+  broken pipe, and stream closed/ended or premature close
+- a bare provider timeout, accepted only as the exact sentence
+  `the operation timed out.` from an unclassified error; the tool-timeout
+  variant carrying the larger-timeout hint stays excluded
 
 Recovery per session: verify the failed assistant message → capture the partial
 output → append a continuation prompt while retaining the full history. Guardrails:

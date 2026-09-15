@@ -23,9 +23,13 @@
 - 明确的 SQL/SQLite/Database 错误，且消息包含 `Failed to execute statement`
   或 `database is locked`；无错误名称时，仅当 `Failed query:` 后紧跟
   `insert`、`select`、`update` 等 SQL 语句关键字才会处理
-- 窄范围的连接/传输错误，例如 connection reset/closed/lost、`ECONN*`、
-  unable to connect、socket hang up、fetch 失败、request/connection/response/read/
-  SSE 超时、`ETIMEDOUT`、broken pipe，以及 stream closed/ended 或 premature close
+- 窄范围的连接/传输错误，例如 connection reset/closed/lost（包括
+  `connection was closed` 等助动词形式）、`ECONN*`、unable to connect、
+  `cannot connect to host` / `connect call failed`、socket hang up、fetch 失败、
+  request/connection/response/read/SSE 超时、`ETIMEDOUT`、broken pipe，
+  以及 stream closed/ended 或 premature close
+- 仅接受未分类错误中精确为 `the operation timed out.` 的裸提供方超时文案；
+  带更大超时提示的工具超时变体仍不处理
 
 恢复流程（按会话）：确认失败的 assistant 消息 → 捕获部分产出 → 保留完整历史并追加续写提示。
 护栏：用户主动停止、鉴权错误、永久性失败、模型/工具输出错误、空输出及静默卡顿

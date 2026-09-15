@@ -82,6 +82,32 @@ for (const message of [
   expect(isRecoverable({ name: "UnknownError", data: { message } }), true, `${message} is recoverable`)
 }
 
+// Evidenced transport shapes: bare provider timeout, auxiliary connection
+// verbs, and upstream connect failures are recoverable; the tool-timeout hint,
+// user aborts, permanent API errors, and generic connection prose stay out.
+const transportShapes: Array<[boolean, string, unknown]> = [
+  [true, "bare provider timeout", { name: "UnknownError", data: { message: "The operation timed out." } }],
+  [true, "bare provider timeout without trailing dot", { name: "UnknownError", data: { message: "The operation timed out" } }],
+  [true, "socket connection was closed", { name: "APIError", message: "Cannot connect to API: The socket connection was closed unexpectedly. " }],
+  [true, "connection has been reset", { name: "UnknownError", data: { message: "connection has been reset" } }],
+  [true, "connection was lost", { name: "UnknownError", data: { message: "connection was lost" } }],
+  [true, "cannot connect to host", { name: "APIError", message: "litellm.InternalServerError: Hosted_vllmException - Cannot connect to host x:80 [Connect call failed ('1.2.3.4', 80)]" }],
+  [true, "connect call failed", { name: "APIError", message: "Connect call failed ('1.2.3.4', 80)" }],
+  [false, "suffixed tool timeout", { name: "UnknownError", data: { message: "The operation timed out. If this command is expected to take longer, please retry with a larger timeout value in milliseconds." } }],
+  [false, "message abort", { name: "MessageAbortedError", message: "Aborted" }],
+  [false, "unknown abort text", { name: "UnknownError", data: { message: "Aborted" } }],
+  [false, "api not found", { name: "APIError", message: "Not Found" }],
+  [false, "api missing key", { name: "APIError", message: "Missing API key." }],
+  [false, "context overflow error", { name: "ContextOverflowError", message: "Session too large to compact - context exceeds model limit" }],
+  [false, "connection is stable", { name: "UnknownError", data: { message: "connection is stable" } }],
+  [false, "connection pool created", { name: "UnknownError", data: { message: "connection pool created" } }],
+  [false, "connection was established", { name: "UnknownError", data: { message: "connection was established" } }],
+  [false, "connection has been idle", { name: "UnknownError", data: { message: "connection has been idle" } }],
+]
+for (const [recoverable, label, error] of transportShapes) {
+  expect(isRecoverable(error), recoverable, `${label} ${recoverable ? "is recoverable" : "stays non-recoverable"}`)
+}
+
 // Model/tool output, generic text, certificates and message-only service
 // errors must stay out of the recovery path.
 for (const message of [
