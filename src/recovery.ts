@@ -37,6 +37,7 @@ import {
 } from "./core"
 import { errorText, isAbortError, isRecoverable } from "./matcher"
 import type { Notifications } from "./notify"
+import { isEmptyOutput } from "./stall"
 
 export interface RecoveryDeps {
   client: PluginInput["client"]
@@ -46,14 +47,31 @@ export interface RecoveryDeps {
   isBlocked: (sessionID: string) => boolean
   cancelRecovery: (sessionID: string, cause: string) => void
   states: Map<string, SessionState>
+  probeTimeoutMs?: number
+  sleep?: (ms: number) => Promise<unknown>
 }
 
-export function createRecovery({ client, log, notify, getState, isBlocked, cancelRecovery, states }: RecoveryDeps) {
+export function createRecovery({ client, log, notify, getState, isBlocked, cancelRecovery, states, probeTimeoutMs = 30_000, sleep: wait = sleep }: RecoveryDeps) {
+  let disposed = false
+  const probes = new Map<string, Set<AbortController>>()
+  async function probe<T>(sessionID: string, run: (signal: AbortSignal) => Promise<T>, timeoutMs: number): Promise<T> {
+    const controller = new AbortController(); const active = probes.get(sessionID) ?? new Set<AbortController>(); active.add(controller); probes.set(sessionID, active)
+    let timer: ReturnType<typeof setTimeout> | undefined
+    let timedOut = false
+    let rejectCancellation!: (error: unknown) => void
+    const cancelled = new Promise<never>((_, reject) => { rejectCancellation = reject })
+    const onAbort = () => { if (!timedOut) rejectCancellation(controller.signal.reason ?? new DOMException("Aborted", "AbortError")) }
+    controller.signal.addEventListener("abort", onAbort, { once: true })
+    try {
+      return await Promise.race([Promise.resolve().then(() => { if (controller.signal.aborted) throw controller.signal.reason; return run(controller.signal) }), cancelled, new Promise<never>((_, reject) => { timer = setTimeout(() => { timedOut = true; reject(new Error("readiness probe timed out")); controller.abort() }, timeoutMs) })])
+    } finally { if (timer) clearTimeout(timer); controller.signal.removeEventListener("abort", onAbort); active.delete(controller); if (!active.size) probes.delete(sessionID) }
+  }
   function backoff(attempt: number): number {
     return Math.min(BACKOFF_BASE_MS * 2 ** (attempt - 1), BACKOFF_MAX_MS)
   }
   async function readMessages(sessionID: string, phase: string): Promise<MessageLike[] | undefined> {
-    const res = await client.session.messages({ path: { id: sessionID } }).catch(async (err) => {
+    const timeout = Math.max(1, Math.min(probeTimeoutMs, stateRemaining(sessionID)))
+    const res = await probe(sessionID, (signal) => client.session.messages({ path: { id: sessionID }, signal } as never), timeout).catch(async (err) => {
       await log(`${phase} ${sessionID}: messages threw: ${err instanceof Error ? err.message : String(err)}`)
       return undefined
     })
@@ -64,8 +82,12 @@ export function createRecovery({ client, log, notify, getState, isBlocked, cance
     }
     return res ? ((res.data ?? []) as MessageLike[]) : undefined
   }
+  function stateRemaining(sessionID: string): number {
+    const started = states.get(sessionID)?.preflightStartedAt
+    return started === undefined ? probeTimeoutMs : Math.max(1, 600_000 - (Date.now() - started))
+  }
   async function serviceStatus(sessionID: string): Promise<{ failed: boolean; type?: string; error?: unknown }> {
-    const result = await client.session.status().then((response) => ({ response })).catch((error: unknown) => ({ error }))
+    const result = await probe(sessionID, (signal) => client.session.status({ signal } as never), Math.max(1, Math.min(probeTimeoutMs, stateRemaining(sessionID)))).then((response) => ({ response })).catch((error: unknown) => ({ error }))
     if ("error" in result) return { failed: true, error: result.error }
     const response = result.response
     if (!response || (response.error !== undefined && response.error !== null)) return { failed: true, error: response?.error }
@@ -112,13 +134,15 @@ export function createRecovery({ client, log, notify, getState, isBlocked, cance
       return true
     }
     queuePendingIfCurrent(state, expectedPending, opts.requestSequence ?? -1, reason, opts, current)
-    await sleep(preflightBackoff(attempt))
+    await wait(preflightBackoff(attempt))
     return false
   }
-  async function recover(sessionID: string, reason: string, opts: RecoveryOptions = {}): Promise<void> {
+  async function runRecovery(sessionID: string, reason: string, opts: RecoveryOptions = {}, preservePreflight = false): Promise<void> {
+    if (disposed) return
     const state = getState(sessionID)
     const generation = state.recoveryGeneration; const requestSequence = opts.requestSequence ?? ++state.recoveryRequestSequence; if (requestSequence > state.recoveryRequestSequence) state.recoveryRequestSequence = requestSequence; if (opts.requestSequence === undefined) opts = { ...opts, requestSequence }; const pendingAtStart = state.pendingRecovery; const current = () => recoveryRequestIsCurrent(state, generation, requestSequence)
     if (!current()) return
+    if (!preservePreflight && startsRecoveryChain(state) && state.preflightAttempts === 0) state.preflightStartedAt = undefined
     if (state.recovering) {
       if (opts.stall) await log(`STALL_SKIP ${sessionID}: recovery in flight`)
       if (recoveryBarrierAllows(state.recoveryCancelled)) queuePendingIfCurrent(state, state.pendingRecovery, requestSequence, reason, opts, current)
@@ -138,7 +162,7 @@ export function createRecovery({ client, log, notify, getState, isBlocked, cance
     const defer = async (detail: string): Promise<void> => {
       if (await deferPreflight(sessionID, state, reason, opts, detail, current, pendingAtStart)) stopScheduling = true
     }
-    const terminalize = (): void => { if (current()) discardPendingRecovery(state, pendingAtStart) }
+    const terminalize = (): void => { if (current()) { discardPendingRecovery(state, pendingAtStart); state.preflightAttempts = 0; state.preflightStartedAt = undefined } }
     try {
       if (state.attempts >= MAX_ATTEMPTS) {
         stopScheduling = true
@@ -151,7 +175,7 @@ export function createRecovery({ client, log, notify, getState, isBlocked, cance
       } else {
         await log(`RECOVER ${sessionID} preparing attempt ${state.attempts + 1}/${MAX_ATTEMPTS} — ${reason}`)
       }
-      if (!current()) return
+      if (!current() || disposed) return
       let messages = await readMessages(sessionID, "RECOVER")
       if (!current()) return
       if (messageReadFailed(messages)) {
@@ -161,7 +185,7 @@ export function createRecovery({ client, log, notify, getState, isBlocked, cance
       if (messages.length === 0) { if (!opts.targetMessageID) { await defer("failed assistant message not ready"); return }; await log(`RECOVER ${sessionID}: no messages, skipping recovery`); terminalize(); return }
       let candidate = candidateAssistant(messages, opts)
       if (!candidate) {
-        await sleep(RE_FETCH_WAIT_MS)
+        await wait(RE_FETCH_WAIT_MS)
         if (!current()) return
         messages = await readMessages(sessionID, "RECOVER")
         if (!current()) return
@@ -173,6 +197,7 @@ export function createRecovery({ client, log, notify, getState, isBlocked, cance
       }
       if (!candidate?.info?.id) { if (!opts.targetMessageID) { await defer("failed assistant message not ready"); return }; await log(`RECOVER ${sessionID}: no current interrupted message, skipping recovery`); terminalize(); return }
       const targetID = opts.targetMessageID ?? candidate.info.id
+      opts = { ...opts, targetMessageID: targetID }
       messages = await readMessages(sessionID, "RECOVER")
       if (!current()) return
       if (messageReadFailed(messages)) {
@@ -223,10 +248,15 @@ export function createRecovery({ client, log, notify, getState, isBlocked, cance
         await stopAtAttemptLimit(sessionID, state, reason, current)
         return
       }
-      if (attempt > 1) { await sleep(backoff(attempt)); if (!current()) return }
-      if (opts.delay) { await sleep(TERMINAL_DELAY_MS); if (!current()) return }
+      if (attempt > 1) { await wait(backoff(attempt)); if (!current() || disposed) return }
+      if (opts.delay) { await wait(TERMINAL_DELAY_MS); if (!current() || disposed) return }
+      // Status can change while either delay is in flight.
+      const finalStatus = await serviceStatus(sessionID)
+      if (!current() || disposed) return
+      if (finalStatus.failed) { if (isAbortError(finalStatus.error)) { cancelRecovery(sessionID, "status probe abort"); return }; const { name, message } = errorText(finalStatus.error); await defer(`status probe failed: ${name}: ${message}`); return }
+      if (finalStatus.type !== undefined && finalStatus.type !== "idle") { if (opts.stall) await log(`STALL_SKIP ${sessionID}: status ${finalStatus.type}`); await defer(`status is ${finalStatus.type}`); return }
       messages = await readMessages(sessionID, "RECOVER")
-      if (!current()) return
+      if (!current() || disposed) return
       if (messageReadFailed(messages)) {
         await defer("message read failed before continuation")
         return
@@ -234,6 +264,7 @@ export function createRecovery({ client, log, notify, getState, isBlocked, cance
       const lastAssistant = targetAssistant(messages, targetID, opts.emptyOutput === true)
       if (!lastAssistant) { await log(`RECOVER ${sessionID}: target ${targetID} changed, skipping recovery`); terminalize(); return }
       if (!lastAssistant.info?.error && !opts.stall && !opts.emptyOutput) { if (isUnfinishedAssistant(lastAssistant)) { await defer("assistant error not ready before continuation"); return }; await log(`RECOVER ${sessionID}: target ${targetID} changed, skipping recovery`); terminalize(); return }
+      if (opts.emptyOutput && !isEmptyOutput(lastAssistant)) { terminalize(); return }
       if (!current() || isBlocked(sessionID)) { if (current()) queuePendingIfCurrent(state, pendingAtStart, requestSequence, reason, opts, current); return }
       const partial = partialText(lastAssistant)
       const hasModel = Boolean(lastAssistant.info?.providerID && lastAssistant.info?.modelID)
@@ -266,6 +297,8 @@ export function createRecovery({ client, log, notify, getState, isBlocked, cance
       if (opts.stall && state.lastRecoveredMessageID === targetID) { await log(`RECOVER ${sessionID}: stall target ${targetID} already recovered, skipping`); terminalize(); return }
       if (opts.stall) await log(`STALL_RECOVER ${sessionID}: status idle, target ${targetID} — ${reason}`)
       if (opts.emptyOutput) await log(`EMPTY_RECOVER ${sessionID}: target ${targetID}`)
+      if (!current() || disposed || !recoveryBarrierAllows(state.recoveryCancelled)) return
+      if (isBlocked(sessionID)) { queuePendingIfCurrent(state, pendingAtStart, requestSequence, reason, opts, current); return }
       state.lastRecoveredMessageID = targetID
       state.lastRecoveredRequestSequence = requestSequence
       state.attempts = attempt; state.preflightAttempts = 0; state.preflightStartedAt = undefined
@@ -293,7 +326,7 @@ export function createRecovery({ client, log, notify, getState, isBlocked, cance
         if (state.lastRecoveredMessageID === targetID && state.lastRecoveredRequestSequence === requestSequence) { state.lastRecoveredMessageID = undefined; state.lastRecoveredRequestSequence = undefined; state.activeRecoveryPromptMessageID = undefined }
         if (isRecoverable(promptError)) {
           queuePendingIfCurrent(state, pendingAtStart, requestSequence, reason, opts, current)
-          await sleep(backoff(attempt))
+          await wait(backoff(attempt))
         } else terminalize()
         if (!current()) return
         return
@@ -305,7 +338,7 @@ export function createRecovery({ client, log, notify, getState, isBlocked, cance
     } finally {
       state.recovering = false
       if (stopScheduling) discardPendingRecovery(state, pendingAtStart)
-      drainPendingRecovery(sessionID, state)
+      if (!disposed) drainPendingRecovery(sessionID, state)
     }
   }
   function drainPendingRecovery(sessionID: string, state: SessionState): void {
@@ -315,9 +348,10 @@ export function createRecovery({ client, log, notify, getState, isBlocked, cance
     if (state.lastRecoveredMessageID && (state.lastRecoveredRequestSequence === undefined || pending.requestSequence === undefined || pending.requestSequence <= state.lastRecoveredRequestSequence)) return
     if (!recoveryBarrierAllows(state.recoveryCancelled)) { discardPendingRecovery(state, pending); return }
     discardPendingRecovery(state, pending)
-    void recover(sessionID, pending.reason, pending)
+    void runRecovery(sessionID, pending.reason, pending, true)
   }
   function drainDeferredRecoveries(): void {
+    if (disposed) return
     for (const [sessionID, state] of states) drainPendingRecovery(sessionID, state)
   }
   function burstGate(state: SessionState, error: unknown): boolean {
@@ -330,6 +364,7 @@ export function createRecovery({ client, log, notify, getState, isBlocked, cance
     return true
   }
   const handleTerminalError = async (sessionID: string, error: unknown, targetMessageID?: string) => {
+    if (disposed) return
     const state = getState(sessionID); const generation = state.recoveryGeneration
     if (!isRecoverable(error)) { state.recoveryRequestSequence++; const { name, message } = errorText(error); if (message || name) void log(`NOT-RECOVERABLE ${sessionID}: ${name}: ${message}`); return }
     if (!recoveryBarrierAllows(state.recoveryCancelled) || !burstGate(state, error)) return
@@ -353,6 +388,7 @@ export function createRecovery({ client, log, notify, getState, isBlocked, cance
     schedule({ delay: true, targetMessageID: targetID })
   }
   function scheduleSilentRecovery(sessionID: string, reason: string, opts: RecoveryOptions): void {
+    if (disposed) return
     const state = getState(sessionID)
     if (state.gaveUp || !recoveryBarrierAllows(state.recoveryCancelled)) return
     const generation = state.recoveryGeneration
@@ -360,7 +396,17 @@ export function createRecovery({ client, log, notify, getState, isBlocked, cance
     const current = () => recoveryRequestIsCurrent(state, generation, requestSequence)
     if (!current()) return
     if (startsRecoveryChain(state)) { state.preflightAttempts = 0; state.preflightStartedAt = undefined }
-    void recover(sessionID, reason, { ...opts, requestSequence })
+    void runRecovery(sessionID, reason, { ...opts, requestSequence })
   }
-  return { recover, handleTerminalError, drainDeferredRecoveries, scheduleSilentRecovery, readMessages }
+  function recover(sessionID: string, reason: string, opts: RecoveryOptions = {}): Promise<void> {
+    return runRecovery(sessionID, reason, opts)
+  }
+  function dispose(): void {
+    disposed = true
+    for (const active of probes.values()) for (const controller of active) controller.abort()
+    probes.clear()
+    for (const state of states.values()) { state.recoveryGeneration++; state.recoveryRequestSequence++; state.pendingRecovery = undefined }
+  }
+  function abortSession(sessionID: string): void { for (const controller of probes.get(sessionID) ?? []) controller.abort() }
+  return { recover, handleTerminalError, drainDeferredRecoveries, scheduleSilentRecovery, readMessages, dispose, abortSession }
 }

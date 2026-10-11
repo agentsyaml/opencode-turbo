@@ -27,6 +27,8 @@ export function trackAction(type: string, props: unknown): TrackAction {
       // An event without a session id cannot be tracked — ignoring it keeps
       // the activity map free of bogus keys that could stall-trigger later.
       return sessionID ? { action: "track", sessionID } : { action: "ignore" }
+    case "message.part.delta":
+      return sessionID ? { action: "track", sessionID } : { action: "ignore" }
     case "message.updated": {
       const info = objectField(props, "info")
       if (!info || (info.role !== "assistant" && info.type !== "assistant")) return { action: "ignore" }
@@ -148,8 +150,7 @@ export function partActivity(part: unknown): PartActivity {
 }
 
 export function lastPartIsRunningTool(parts: unknown): boolean {
-  if (!Array.isArray(parts) || parts.length === 0) return false
-  return partActivity(parts[parts.length - 1]) === "tool-wait"
+  return Array.isArray(parts) && parts.some((part) => partActivity(part) === "tool-wait")
 }
 
 function stringField(value: unknown, key: string): string | undefined {
@@ -207,6 +208,7 @@ export interface StallWatchOptions {
 
 interface WatchEntry extends StallSnapshot {
   toolWaitLogged: boolean
+  outstandingTools: Set<string>
 }
 
 export function createStallWatch(options: StallWatchOptions): StallWatch {
@@ -217,7 +219,7 @@ export function createStallWatch(options: StallWatchOptions): StallWatch {
   function entry(id: string): WatchEntry {
     let value = entries.get(id)
     if (!value) {
-      value = { lastStreamActivity: clock(), lastPartIsRunningTool: false, toolWaitLogged: false }
+      value = { lastStreamActivity: clock(), lastPartIsRunningTool: false, toolWaitLogged: false, outstandingTools: new Set() }
       entries.set(id, value)
     }
     return value
@@ -225,7 +227,7 @@ export function createStallWatch(options: StallWatchOptions): StallWatch {
   function touchStream(id: string): void {
     const value = entry(id)
     value.lastStreamActivity = clock()
-    value.lastPartIsRunningTool = false
+    value.lastPartIsRunningTool = value.outstandingTools.size > 0
     value.toolWaitLogged = false
   }
   function note(type: string, props: unknown): void {
@@ -248,16 +250,38 @@ export function createStallWatch(options: StallWatchOptions): StallWatch {
       const value = entry(id)
       if (part && typeof part.messageID === "string") value.lastMessageID = part.messageID
       if (activity === "tool-wait") {
+        value.outstandingTools.add(toolID(part) ?? "\0unknown-tool")
         value.lastPartIsRunningTool = true
         return
       }
+      if (part && part.type === "tool") {
+        const tool = toolID(part)
+        if (tool) value.outstandingTools.delete(tool)
+        value.lastPartIsRunningTool = value.outstandingTools.size > 0
+        value.lastStreamActivity = clock()
+        value.toolWaitLogged = false
+        return
+      }
       touchStream(id)
+      return
+    }
+    if (type === "message.part.delta") {
+      const p = props as Record<string, unknown>
+      const value = entries.get(id)
+      if (!value || typeof p.messageID !== "string" || p.messageID !== value.lastMessageID) return
+      if (p.field !== "text" && p.field !== "reasoning") return
+      value.lastStreamActivity = clock()
+      value.toolWaitLogged = false
       return
     }
     if (type === "message.updated") {
       const info = objectField(props, "info")
       const value = entry(id)
       if (info && typeof info.id === "string") value.lastMessageID = info.id
+      if (info && (info.error || terminalFinish(info.finish))) {
+        value.outstandingTools.clear()
+        value.lastPartIsRunningTool = false
+      }
       touchStream(id)
       return
     }
@@ -293,6 +317,13 @@ export function createStallWatch(options: StallWatchOptions): StallWatch {
     entries.clear()
   }
   return { enabled, note, sweep, forget, snapshot, dispose }
+}
+
+function toolID(part: Record<string, unknown> | undefined): string | undefined {
+  if (!part) return undefined
+  if (typeof part.id === "string" && part.id.length > 0) return part.id
+  if (typeof part.callID === "string" && part.callID.length > 0) return part.callID
+  return undefined
 }
 
 

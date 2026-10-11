@@ -4,6 +4,7 @@
 import type { PluginInput } from "@opencode-ai/plugin"
 import { EMPTY_CONTINUATION, PREFLIGHT_GIVE_UP_MS, createState, targetAssistant, type MessageLike, type SessionState } from "./core.ts"
 import { createRecovery } from "./recovery.ts"
+import "./self-check-recovery-races.ts"
 import { createStallWatch, idleAction, isEmptyOutput, lastPartIsRunningTool, partActivity, stallCandidates, stallEligible, trackAction } from "./stall.ts"
 
 function expect(actual: boolean, expected: boolean, label: string): void {
@@ -83,7 +84,7 @@ expect(partActivity({ type: "tool", state: { status: "running" } }) === "tool-wa
 expect(partActivity({ type: "tool", state: { status: "pending" } }) === "tool-wait", true, "pending tool is tool-wait")
 expect(partActivity({ type: "step-start" }) === "ignore", true, "structural part is ignored")
 expect(lastPartIsRunningTool([{ type: "text" }, { type: "tool", state: { status: "running" } }]), true, "last running tool is detected")
-expect(lastPartIsRunningTool([{ type: "tool", state: { status: "running" } }, { type: "text" }]), false, "trailing text means no tool wait")
+expect(lastPartIsRunningTool([{ type: "tool", state: { status: "running" } }, { type: "text" }]), true, "outstanding running tool remains a wait despite trailing text")
 expect(lastPartIsRunningTool([]), false, "empty parts are not a tool wait")
 
 // ── stallEligible (pure safety gate) ────────────────────────────────────────

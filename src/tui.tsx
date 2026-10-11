@@ -80,7 +80,12 @@ export function toolInputTokensOf(input: unknown): number | undefined {
   if (input === undefined || input === null) return undefined
   if (typeof input === "string") return input.length > 0 ? estimateTokens(input) : undefined
   // Pending tools carry an empty object until the args arrive — no tokens yet.
-  const json = JSON.stringify(input)
+  let json: string | undefined
+  try {
+    json = JSON.stringify(input)
+  } catch {
+    return undefined
+  }
   if (json === undefined || json === "{}") return undefined
   return estimateTokens(json)
 }
@@ -89,6 +94,39 @@ export function toolInputTokensOf(input: unknown): number | undefined {
 export function contentToolTokens(tool: string | undefined, input: unknown): number | undefined {
   if (!tool || !CONTENT_TOOLS.has(tool)) return undefined
   return toolInputTokensOf(input)
+}
+
+/** Estimated prompt tokens for an active oh-my-opencode-slim task/subagent dispatch. */
+function delegationPrompt(tool: string | undefined, input: unknown): string | undefined {
+  if (tool !== "task" && tool !== "subagent") return undefined
+  if (typeof input !== "object" || input === null || Array.isArray(input)) return undefined
+  const args = input as { prompt?: unknown; task_id?: unknown }
+  return typeof args.prompt === "string" && args.prompt.trim() !== "" ? args.prompt : undefined
+}
+
+export function delegationPromptTokensOf(tool: string | undefined, input: unknown): number | undefined {
+  const prompt = delegationPrompt(tool, input)
+  return prompt === undefined ? undefined : estimateTokens(prompt)
+}
+
+export type ToolTokenCache = {
+  inputRef?: unknown
+  prompt?: string
+  tokens?: number
+  tokenLabel?: "prompt"
+  initialized?: boolean
+}
+
+/** Update cached tool estimates; also detects in-place changes to delegation prompts. */
+export function updateToolTokenCache(cache: ToolTokenCache, tool: string | undefined, input: unknown): void {
+  const prompt = delegationPrompt(tool, input)
+  if (!cache.initialized || cache.inputRef !== input || cache.prompt !== prompt) {
+    cache.inputRef = input
+    cache.prompt = prompt
+    cache.tokens = prompt === undefined ? contentToolTokens(tool, input) : estimateTokens(prompt)
+    cache.tokenLabel = prompt === undefined ? undefined : "prompt"
+    cache.initialized = true
+  }
 }
 
 /** The currently running or preparing tool. Pure, exported for self-check. */
@@ -134,7 +172,7 @@ export function completionOf(message: MessageLike | undefined): { ms: number; at
 const SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
 export interface PanelState {
-  tool?: { name: string; elapsed: number; tokens?: number; timeout?: number }
+  tool?: { name: string; elapsed: number; tokens?: number; tokenLabel?: "prompt"; timeout?: number }
   thinking: number
   thinkingElapsed?: number
   waiting: boolean
@@ -155,7 +193,11 @@ export interface PanelState {
 export function panelRow(state: PanelState): string {
   const { tool, thinking, thinkingElapsed, waiting, waitElapsed, working, workElapsed, workingSpin, textTokens, done, failed } = state
   if (tool) {
-    const tokensSuffix = tool.tokens !== undefined ? ` · ${tool.tokens.toLocaleString()} tokens` : ""
+    const tokensSuffix = tool.tokens !== undefined
+      ? tool.tokenLabel === "prompt"
+        ? ` · ~${tool.tokens.toLocaleString()} prompt tokens`
+        : ` · ${tool.tokens.toLocaleString()} tokens`
+      : ""
     // Whole-second limits read cleaner than "30.0s"; elapsed keeps its sub-second precision.
     const timeoutSuffix = tool.timeout !== undefined ? ` / ${formatDuration(tool.timeout).replace(/\.0s$/, "s")}` : ""
     return `🔧 ${tool.name} · ${formatDuration(tool.elapsed)}${timeoutSuffix}${tokensSuffix}`
@@ -192,7 +234,7 @@ function StatusPanel(props: { api: TuiPluginApi; session_id: string }) {
   // every progress event, so anchor elapsed to the FIRST time the panel sees
   // each tool call active. ponytail: map grows one entry per tool call per
   // panel — clear it if a long-lived session ever shows memory growth.
-  const toolAnchors = new Map<string, { start: number; tokens?: number; inputRef?: unknown }>()
+  const toolAnchors = new Map<string, { start: number } & ToolTokenCache>()
 
   const compute = () => {
     const now = Date.now()
@@ -237,13 +279,17 @@ function StatusPanel(props: { api: TuiPluginApi; session_id: string }) {
       let anchor = toolAnchors.get(found.callID)
       const start = found.start ?? anchor?.start ?? now
       if (anchor === undefined) {
-        anchor = { start, tokens: contentToolTokens(found.tool, found.input), inputRef: found.input }
+        anchor = { start }
         toolAnchors.set(found.callID, anchor)
-      } else if (anchor.inputRef !== found.input) {
-        anchor.inputRef = found.input
-        anchor.tokens = contentToolTokens(found.tool, found.input)
       }
-      tool = { name: found.name, elapsed: now - start, tokens: anchor.tokens, timeout: found.timeout }
+      updateToolTokenCache(anchor, found.tool, found.input)
+      tool = {
+        name: found.name,
+        elapsed: now - start,
+        tokens: anchor.tokens,
+        tokenLabel: anchor.tokenLabel,
+        timeout: found.timeout,
+      }
     }
 
     // Thinking only while the reasoning is still streaming. The counter stops

@@ -6,6 +6,7 @@ import { clearPendingRecovery, createState, discardPendingRecovery, isBlockedSes
 import { estimateTokens, formatDuration } from "./util.ts"
 import { isActiveStatus } from "./stall.ts"
 import { completionOf, contentToolTokens, hasPendingUserRequest, lastAssistantOf, panelRow, runningToolOf, textTokensOf, thinkingTokensOf, toolInputTokensOf } from "./tui.tsx"
+import "./self-check-watch.ts"
 
 function expect(actual: boolean, expected: boolean, label: string): void {
   if (actual !== expected) {

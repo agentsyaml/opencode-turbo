@@ -27,6 +27,8 @@ const plugin: Plugin = async ({ client }: PluginInput, options: PluginOptions = 
   const parentBySession = new Map<string, string>()
   const knownSessions = new Set<string>()
   const deletedSessions = new Set<string>()
+  let disposed = false
+  let abortRecoveryProbes: (sessionID: string) => void = () => {}
   const unknownParentPending = new Set<string>()
   const notify = createNotifications(client)
   void log("PLUGIN LOADED — opencode-turbo ready (recovery + stall watchdog + notifications)")
@@ -79,12 +81,14 @@ const plugin: Plugin = async ({ client }: PluginInput, options: PluginOptions = 
   }
   function cancelRecovery(sessionID: string, cause: string): void {
     void log(`CANCELLED ${sessionID}: ${cause}`)
+    abortRecoveryProbes(sessionID)
     const state = getState(sessionID)
     state.recoveryCancelled = true; state.recoveryGeneration++; state.pendingRecovery = undefined; state.lastRecoveredMessageID = undefined; state.lastRecoveredRequestSequence = undefined; state.preflightAttempts = 0; state.preflightStartedAt = undefined; state.lastEmptyOutputMessageID = undefined
     state.lastErrorKey = undefined; state.lastErrorTime = 0
     clearSessionPending(sessionID)
   }
   const recovery = createRecovery({ client, log, notify, getState, isBlocked, cancelRecovery, states })
+  abortRecoveryProbes = recovery.abortSession
   drainDeferred = recovery.drainDeferredRecoveries
   const watch = createStallWatch({
     timeoutMs: stallTimeoutMs,
@@ -93,7 +97,7 @@ const plugin: Plugin = async ({ client }: PluginInput, options: PluginOptions = 
     log: (message) => void log(message),
     eligible: (id, now, snapshot) => {
       const state = states.get(id)
-      if (!state) return false
+      if (disposed || !state) return false
       return stallEligible({
         now,
         lastStreamActivity: snapshot.lastStreamActivity,
@@ -117,7 +121,7 @@ const plugin: Plugin = async ({ client }: PluginInput, options: PluginOptions = 
       const snapshot = watch.snapshot(id)
       watch.forget(id)
       const quietMs = snapshot ? now - snapshot.lastStreamActivity : stallTimeoutMs
-      void recovery.recover(id, `STALL_TIMEOUT: no events for ~${Math.round(quietMs / 60000)}min`, { stall: true })
+      void recovery.recover(id, `STALL_TIMEOUT: no events for ~${Math.round(quietMs / 60000)}min`, { stall: true, targetMessageID: snapshot?.lastMessageID })
     }
   }, STALL_CHECK_MS) : undefined
   stallTimer?.unref?.()
@@ -169,6 +173,7 @@ const plugin: Plugin = async ({ client }: PluginInput, options: PluginOptions = 
   }
   return {
     event: async ({ event }: { event: Event }): Promise<void> => {
+      if (disposed) return
       try {
         const p = (event.properties ?? {}) as Record<string, any>
         const eventID = (event.type === "session.created" || event.type === "session.updated" || event.type === "session.deleted") && typeof p.info?.id === "string" ? p.info.id : typeof p.sessionID === "string" ? p.sessionID : typeof p.data?.sessionID === "string" ? p.data.sessionID : typeof p.info?.sessionID === "string" ? p.info.sessionID : typeof p.part?.sessionID === "string" ? p.part.sessionID : undefined
@@ -208,6 +213,7 @@ const plugin: Plugin = async ({ client }: PluginInput, options: PluginOptions = 
           case "message.updated": {
             const info = (event.properties as { info?: MessageLike["info"] }).info
             if (!info?.sessionID) return
+            if (disposed || deletedSessions.has(info.sessionID)) return
             const state = getState(info.sessionID)
             if (info.role === "user") { if (isGenuineRecoveryUserMessage(state.recoveryPromptMessageIDs, info.id)) { state.recoveryPromptMessageIDs.clear(); state.recoveryPromptRequestSequences.clear(); state.activeRecoveryPromptMessageID = undefined; state.recoveryCancelled = false; void log(`REVIVED ${info.sessionID}: genuine user message cleared abort barrier`); recovery.drainDeferredRecoveries() }; return }
             if (info.role !== "assistant") return
@@ -218,11 +224,15 @@ const plugin: Plugin = async ({ client }: PluginInput, options: PluginOptions = 
             } else if (info.finish && info.finish !== "tool-calls" && info.finish !== "unknown") {
               if (info.id && info.id === state.lastRecoveredMessageID) return
               if (emptyOutputEnabled && info.id && !state.recoveryCancelled && !state.gaveUp && state.lastEmptyOutputMessageID !== info.id) {
+                const generation = state.recoveryGeneration
+                const sequence = state.recoveryRequestSequence
                 const messages = await recovery.readMessages(info.sessionID, "EMPTY")
+                if (disposed || deletedSessions.has(info.sessionID) || states.get(info.sessionID) !== state || state.recoveryGeneration !== generation || state.recoveryRequestSequence !== sequence || state.recoveryCancelled || state.gaveUp || state.lastEmptyOutputMessageID === info.id) return
                 const target = messages?.find((message) => message.info?.id === info.id)
                 if (target && isEmptyOutput(target)) {
                   state.lastEmptyOutputMessageID = info.id
                   await log(`EMPTY_OUTPUT: ${info.id} finished with no output`)
+                  if (disposed || deletedSessions.has(info.sessionID) || states.get(info.sessionID) !== state || state.recoveryGeneration !== generation || state.recoveryRequestSequence !== sequence || state.recoveryCancelled || state.gaveUp) return
                   recovery.scheduleSilentRecovery(info.sessionID, `EMPTY_OUTPUT: ${info.id} finished with no output`, { targetMessageID: info.id, emptyOutput: true })
                   return
                 }
@@ -266,8 +276,10 @@ const plugin: Plugin = async ({ client }: PluginInput, options: PluginOptions = 
       }
     },
     dispose: async () => {
+      disposed = true
       if (stallTimer) clearInterval(stallTimer)
       watch.dispose()
+      recovery.dispose()
       notify.dispose()
     },
   }

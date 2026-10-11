@@ -138,6 +138,14 @@ function isSqlFailure(message: string): boolean {
   return message.includes("failed to execute statement") || message.includes("database is locked")
 }
 
+function isPermanentSqlFailure(message: string): boolean {
+  return /\b(?:no such table|no such column|syntax error|unique constraint failed|constraint failed|foreign key constraint failed|not null constraint failed|check constraint failed|table .* has no column named|datatype mismatch)\b/i.test(message)
+}
+
+function isTransientSqlLock(message: string): boolean {
+  return /\b(?:database is locked|database is busy|sqlite_busy|sqlite_locked)\b/i.test(message)
+}
+
 function isFailedQuery(message: string): boolean {
   return /failed query:\s*(?:select|insert|update|delete|replace|with|create|alter|drop|pragma|begin|commit|rollback|vacuum|attach|detach|reindex|analyze|end|savepoint|release|truncate|merge)\b/.test(message)
 }
@@ -222,8 +230,10 @@ export function isRecoverable(error: unknown): boolean {
   if (isTransientCertificateNetworkError(name, identifiers, message, dataMessage)) return true
   if (hasExactCertificateIdentifier(identifiers)) return false
   if (normalizedName === "messageoutputlengtherror" || hasAny(match, PERMANENT_PATTERNS)) return false
+  if (isPermanentSqlFailure(messageText)) return false
   if (UPSTREAM_CONNECT.test(match) && !CERTIFICATE_VERIFY.test(match)) return true
   if (hasAny(match, CERTIFICATE_PERMANENT_PATTERNS)) return false
+  if (isTransientSqlLock(messageText)) return true
 
   if (isAPIError) {
     if (statusCode !== undefined) return RETRY_STATUS_CODES.has(statusCode)

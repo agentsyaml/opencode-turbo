@@ -60,7 +60,8 @@ TLS/证书错误只有精确的 Bun 错误码并搭配精确的
 
 - `🔧 bash · 12.5s` — 正在运行的工具及耗时；模型显式设置了超时上限时显示
   预算：`🔧 bash · 12.5s / 30s`；内容类工具额外显示输入 token
-  估算：`🔧 edit · 2.5s · 567 tokens`
+  估算：`🔧 edit · 2.5s · 567 tokens`；带提示词的 `task`/`subagent` 调用（包括续跑）会显示
+  提示词 token 估算，例如 `🔧 task · 2.5s · ~567 prompt tokens`（不代表子代理上下文或计费用量）
 - `🤔 Thinking · 12.0s · 1,234 tokens` — 耗时在前，推理 token 数（估算）
   在后
 - `⠋ Working · 3.2s · 567 tokens` — 动画转圈图标，该阶段耗时在前，已累计
