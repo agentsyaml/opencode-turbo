@@ -88,6 +88,10 @@ TLS/证书错误只有精确的 Bun 错误码并搭配精确的
 }
 ```
 
+支持 OpenCode V1 **>=1.19.0**，V2 按 **2.0.27** API 适配；同一包提供两版服务端恢复及 TUI 状态行。
+
+V2 使用 `"plugins": ["@alexsun-top/opencode-turbo"]`；传参使用 `"plugins": [{ "package": "@alexsun-top/opencode-turbo", "options": { "stallTimeoutMs": 1800000, "emptyOutput": true } }]`。V2 通知通过插件公开 RPC 事件传给 CLI，无 CLI 时服务端仍可恢复。本文其他 `plugin` 单数配置示例用于 V1。
+
 本地开发可直接指向源码：
 
 ```json

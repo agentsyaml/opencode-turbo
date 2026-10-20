@@ -225,7 +225,11 @@ function mockClient(
 function makeRecovery(client: PluginInput["client"], states: Map<string, SessionState>) {
   const getState = (id: string): SessionState => { const state = states.get(id) ?? createState(); states.set(id, state); return state }
   return createRecovery({
-    client,
+    runtime: {
+      messages: async (id) => (await client.session.messages({ path: { id } })).data as MessageLike[],
+      status: async (id) => ((await client.session.status({})).data as Record<string, { type?: string }>)[id]?.type,
+      prompt: async ({ sessionID, messageID, parts }) => { const result = await client.session.prompt({ path: { id: sessionID }, body: { messageID, parts } } as never); if (result.error) throw result.error },
+    },
     log: async () => {},
     notify: { onSessionStatusRetry() {}, onRecoveryStart() {}, onRecoveryStopped() {}, dispose() {} },
     getState,

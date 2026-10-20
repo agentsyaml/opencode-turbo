@@ -38,11 +38,12 @@ export interface Notifications {
   dispose(): void
 }
 
-export function createNotifications(client: PluginInput["client"]): Notifications {
+export function createNotifications(client: PluginInput["client"] | ((sessionID: string, toast: { title: string; message: string; variant: ToastVariant; duration: number }) => void | Promise<void>)): Notifications {
   const slots = new Map<string, ToastSlot>()
 
-  function showToast(title: string, message: string, variant: ToastVariant, duration: number): void {
-    client.tui.showToast({ body: { title, message, variant, duration } }).catch(() => {})
+  function showToast(sessionID: string, title: string, message: string, variant: ToastVariant, duration: number): void {
+    if (typeof client === "function") void Promise.resolve(client(sessionID, { title, message, variant, duration })).catch(() => {})
+    else client.tui.showToast({ body: { title, message, variant, duration } }).catch(() => {})
   }
 
   function flush(key: string, slot: ToastSlot): void {
@@ -50,7 +51,7 @@ export function createNotifications(client: PluginInput["client"]): Notification
     slot.last = Date.now()
     const pending = slot.pending
     slot.pending = null
-    showToast(pending.title, pending.message, pending.variant, pending.duration)
+    showToast(key.slice(key.indexOf(":") + 1), pending.title, pending.message, pending.variant, pending.duration)
   }
 
   /** Trailing-throttled toast per key: keeps the latest message, refreshes at most every LIVE_THROTTLE_MS. */
@@ -88,7 +89,7 @@ export function createNotifications(client: PluginInput["client"]): Notification
   }
 
   function onRecoveryStopped(_sessionID: string, message: string): void {
-    showToast("⛔ Auto-recovery stopped", short(message, MAX_MESSAGE_CHARS), "error", DONE_DURATION_MS)
+    showToast(_sessionID, "⛔ Auto-recovery stopped", short(message, MAX_MESSAGE_CHARS), "error", DONE_DURATION_MS)
   }
 
   function dispose(): void {

@@ -13,11 +13,12 @@
 // reconciler uses, because the renderable ref belongs to the host renderer.
 
 import type { TuiPlugin, TuiPluginApi, TuiPluginModule } from "@opencode-ai/plugin/tui"
+import type { Plugin as V2Plugin } from "@opencode/plugin/tui"
 import { onCleanup } from "solid-js"
 import { isAbortError } from "./matcher"
 import { estimateTokens, formatDuration } from "./util"
 
-type PartLike = {
+export type PartLike = {
   id?: string
   callID?: string
   type?: string
@@ -29,7 +30,7 @@ type PartLike = {
   time?: { start?: number; end?: number; created?: number; ran?: number; completed?: number }
 }
 
-type MessageLike = {
+export type MessageLike = {
   id?: string
   type?: string
   role?: string
@@ -460,6 +461,12 @@ const tui: TuiPlugin = async (api) => {
 // File-based (path) plugins MUST export a non-empty `id` — the TUI runtime
 // rejects path plugins without one (resolvePluginId throws "Path plugin ...
 // must export id"), dropping the plugin before tui() is ever called.
-const plugin: TuiPluginModule = { id: "opencode-turbo", tui }
+const plugin: TuiPluginModule & Pick<V2Plugin.Definition, "setup"> = {
+  id: "opencode-turbo",
+  tui,
+  async setup(context) {
+    return (await import("./tui-v2")).v2TuiSetup(context)
+  },
+}
 
 export default plugin

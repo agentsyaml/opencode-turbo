@@ -5,7 +5,7 @@
 // same code that previously lived inline in index.ts; the entry passes in the
 // shared state maps, logging, notifications, block predicate and cancellation.
 
-import type { PluginInput } from "@opencode-ai/plugin"
+import type { RecoveryRuntime } from "./runtime/recovery"
 import {
   BACKOFF_BASE_MS,
   BACKOFF_MAX_MS,
@@ -40,7 +40,7 @@ import type { Notifications } from "./notify"
 import { isEmptyOutput } from "./stall"
 
 export interface RecoveryDeps {
-  client: PluginInput["client"]
+  runtime: RecoveryRuntime
   log: (message: string) => Promise<void>
   notify: Notifications
   getState: (sessionID: string) => SessionState
@@ -51,7 +51,7 @@ export interface RecoveryDeps {
   sleep?: (ms: number) => Promise<unknown>
 }
 
-export function createRecovery({ client, log, notify, getState, isBlocked, cancelRecovery, states, probeTimeoutMs = 30_000, sleep: wait = sleep }: RecoveryDeps) {
+export function createRecovery({ runtime, log, notify, getState, isBlocked, cancelRecovery, states, probeTimeoutMs = 30_000, sleep: wait = sleep }: RecoveryDeps) {
   let disposed = false
   const probes = new Map<string, Set<AbortController>>()
   async function probe<T>(sessionID: string, run: (signal: AbortSignal) => Promise<T>, timeoutMs: number): Promise<T> {
@@ -71,28 +71,22 @@ export function createRecovery({ client, log, notify, getState, isBlocked, cance
   }
   async function readMessages(sessionID: string, phase: string): Promise<MessageLike[] | undefined> {
     const timeout = Math.max(1, Math.min(probeTimeoutMs, stateRemaining(sessionID)))
-    const res = await probe(sessionID, (signal) => client.session.messages({ path: { id: sessionID }, signal } as never), timeout).catch(async (err) => {
+    const res = await probe(sessionID, (signal) => runtime.messages(sessionID, signal), timeout).catch(async (err) => {
       await log(`${phase} ${sessionID}: messages threw: ${err instanceof Error ? err.message : String(err)}`)
       return undefined
     })
-    if (res?.error) {
-      const { name, message } = errorText(res.error)
-      await log(`${phase} ${sessionID}: messages failed: ${name}: ${message}`)
-      return undefined
-    }
-    return res ? ((res.data ?? []) as MessageLike[]) : undefined
+    return res
   }
   function stateRemaining(sessionID: string): number {
     const started = states.get(sessionID)?.preflightStartedAt
     return started === undefined ? probeTimeoutMs : Math.max(1, 600_000 - (Date.now() - started))
   }
   async function serviceStatus(sessionID: string): Promise<{ failed: boolean; type?: string; error?: unknown }> {
-    const result = await probe(sessionID, (signal) => client.session.status({ signal } as never), Math.max(1, Math.min(probeTimeoutMs, stateRemaining(sessionID)))).then((response) => ({ response })).catch((error: unknown) => ({ error }))
+    const result = await probe(sessionID, (signal) => runtime.status(sessionID, signal), Math.max(1, Math.min(probeTimeoutMs, stateRemaining(sessionID)))).then((response) => ({ response })).catch((error: unknown) => ({ error }))
     if ("error" in result) return { failed: true, error: result.error }
-    const response = result.response
-    if (!response || (response.error !== undefined && response.error !== null)) return { failed: true, error: response?.error }
-    const type = (response.data as Record<string, { type?: unknown }> | undefined)?.[sessionID]?.type
-    return { failed: false, ...(typeof type === "string" ? { type } : {}) }
+    const type = result.response
+    if (typeof type === "string") return { failed: false, type }
+    return runtime.statusRequired ? { failed: true, error: new Error("session status unavailable") } : { failed: false }
   }
   function queuePendingIfCurrent(
     state: SessionState,
@@ -304,21 +298,18 @@ export function createRecovery({ client, log, notify, getState, isBlocked, cance
       state.attempts = attempt; state.preflightAttempts = 0; state.preflightStartedAt = undefined
       const promptMessageID = `msg_${crypto.randomUUID()}`; state.activeRecoveryPromptMessageID = promptMessageID; state.recoveryPromptMessageIDs.add(promptMessageID); state.recoveryPromptRequestSequences.set(promptMessageID, requestSequence)
       notify.onRecoveryStart(sessionID, attempt, MAX_ATTEMPTS)
-      const promptResult = await client.session
-        .prompt({
-          path: { id: sessionID },
-          body: {
-            messageID: promptMessageID,
-            model,
-            agent: typeof lastUser.info.agent === "string" ? lastUser.info.agent : undefined,
-            parts,
-          },
-        })
+      const promptResult = await runtime.prompt({
+        sessionID,
+        messageID: promptMessageID,
+        model,
+        agent: typeof lastUser.info.agent === "string" ? lastUser.info.agent : undefined,
+        parts,
+      })
         .then((response) => ({ response }))
         .catch((error: unknown) => ({ error }))
       if (!current()) return
-      const promptError = "error" in promptResult ? promptResult.error : promptResult.response?.error
-      if ("error" in promptResult || !promptResult.response || (promptResult.response.error !== undefined && promptResult.response.error !== null)) {
+      const promptError = "error" in promptResult ? promptResult.error : promptResult.response
+      if ("error" in promptResult || promptError !== undefined) {
         if (isAbortError(promptError)) { cancelRecovery(sessionID, "continuation prompt abort"); return }
         const { name, message } = errorText(promptError)
         await log(`RECOVER ${sessionID}: continuation prompt failed: ${name}: ${message}`)

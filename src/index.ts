@@ -1,5 +1,6 @@
-import type { Hooks, Plugin, PluginInput, PluginOptions } from "@opencode-ai/plugin"
+import type { Hooks, Plugin as V1Plugin, PluginInput, PluginOptions } from "@opencode-ai/plugin"
 import type { Event } from "@opencode-ai/sdk"
+import type { Plugin } from "@opencode/plugin"
 import { appendFile, mkdir } from "node:fs/promises"
 import { homedir } from "node:os"
 import { dirname, join } from "node:path"
@@ -8,6 +9,7 @@ import { errorText, isAbortError } from "./matcher"
 import { createNotifications } from "./notify"
 import { createRecovery } from "./recovery"
 import { createStallWatch, isEmptyOutput, stallEligible, trackAction } from "./stall"
+import type { RecoveryRuntime } from "./runtime/recovery"
 const logPath = join(homedir(), ".local", "share", "opencode", "logs", "auto-recover.log")
 async function log(message: string): Promise<void> {
   try {
@@ -16,7 +18,7 @@ async function log(message: string): Promise<void> {
   } catch {
   }
 }
-const plugin: Plugin = async ({ client }: PluginInput, options: PluginOptions = {}): Promise<Hooks> => {
+const plugin: V1Plugin = async ({ client }: PluginInput, options: PluginOptions = {}): Promise<Hooks> => {
   const stallTimeoutMs = typeof options.stallTimeoutMs === "number" && options.stallTimeoutMs >= 0 ? options.stallTimeoutMs : STALL_TIMEOUT_MS
   const emptyOutputEnabled = options.emptyOutput !== false
   const states = new Map<string, SessionState>()
@@ -25,12 +27,16 @@ const plugin: Plugin = async ({ client }: PluginInput, options: PluginOptions = 
   const pendingRequests = new Map<string, Set<string>>()
   const pendingWithoutID = new Map<string, number>()
   const parentBySession = new Map<string, string>()
+  const seenUserMessageIDs = new Map<string, Set<string>>()
   const knownSessions = new Set<string>()
   const deletedSessions = new Set<string>()
   let disposed = false
+  const pluginStartedAt = Date.now()
   let abortRecoveryProbes: (sessionID: string) => void = () => {}
   const unknownParentPending = new Set<string>()
-  const notify = createNotifications(client)
+  const notify = createNotifications(typeof (options as Record<string, unknown>).notificationSender === "function"
+    ? (options as Record<string, unknown>).notificationSender as (sessionID: string, toast: { title: string; message: string; variant: "info" | "success" | "warning" | "error"; duration: number }) => void | Promise<void>
+    : client)
   void log("PLUGIN LOADED — opencode-turbo ready (recovery + stall watchdog + notifications)")
   const getState = (sessionID: string): SessionState => {
     const state = states.get(sessionID) ?? createState(); states.set(sessionID, state); return state
@@ -87,7 +93,25 @@ const plugin: Plugin = async ({ client }: PluginInput, options: PluginOptions = 
     state.lastErrorKey = undefined; state.lastErrorTime = 0
     clearSessionPending(sessionID)
   }
-  const recovery = createRecovery({ client, log, notify, getState, isBlocked, cancelRecovery, states })
+  const runtime: RecoveryRuntime = {
+    statusRequired: (options as Record<string, unknown>).statusRequired === true,
+    messages: async (sessionID, signal) => {
+      const response = await client.session.messages({ path: { id: sessionID }, signal } as never)
+      if (response.error) throw response.error
+      return (response.data ?? []) as MessageLike[]
+    },
+    status: async (_sessionID, signal) => {
+      const response = await client.session.status({ signal } as never)
+      if (response.error) throw response.error
+      const status = (response.data as Record<string, { type?: string }> | undefined)?.[_sessionID]?.type
+      return typeof status === "string" ? status : undefined
+    },
+    prompt: async ({ sessionID, messageID, model, agent, parts }) => {
+      const response = await client.session.prompt({ path: { id: sessionID }, body: { messageID, model, agent, parts } })
+      if (response.error) throw response.error
+    },
+  }
+  const recovery = createRecovery({ runtime, log, notify, getState, isBlocked, cancelRecovery, states })
   abortRecoveryProbes = recovery.abortSession
   drainDeferred = recovery.drainDeferredRecoveries
   const watch = createStallWatch({
@@ -215,7 +239,26 @@ const plugin: Plugin = async ({ client }: PluginInput, options: PluginOptions = 
             if (!info?.sessionID) return
             if (disposed || deletedSessions.has(info.sessionID)) return
             const state = getState(info.sessionID)
-            if (info.role === "user") { if (isGenuineRecoveryUserMessage(state.recoveryPromptMessageIDs, info.id)) { state.recoveryPromptMessageIDs.clear(); state.recoveryPromptRequestSequences.clear(); state.activeRecoveryPromptMessageID = undefined; state.recoveryCancelled = false; void log(`REVIVED ${info.sessionID}: genuine user message cleared abort barrier`); recovery.drainDeferredRecoveries() }; return }
+            if (info.role === "user") {
+              if (!info.id) return
+              const seen = seenUserMessageIDs.get(info.sessionID) ?? new Set<string>()
+              seenUserMessageIDs.set(info.sessionID, seen)
+              if (seen.has(info.id)) return
+              seen.add(info.id)
+              const createdAt = (info as NonNullable<typeof info> & { time?: { created?: number } }).time?.created
+              if (typeof createdAt === "number" && createdAt < pluginStartedAt) return
+              if (isGenuineRecoveryUserMessage(state.recoveryPromptMessageIDs, info.id)) {
+                abortRecoveryProbes(info.sessionID)
+                state.recoveryGeneration++
+                state.recoveryRequestSequence++
+                state.pendingRecovery = undefined
+                resetRecoveryAfterSuccess(state)
+                state.recoveryCancelled = false
+                void log(`REVIVED ${info.sessionID}: genuine user message reset stale recovery state`)
+                recovery.drainDeferredRecoveries()
+              }
+              return
+            }
             if (info.role !== "assistant") return
             if (info.error) {
               if (isAbortError(info.error)) { cancelRecovery(info.sessionID, "assistant message abort"); return }
@@ -252,6 +295,7 @@ const plugin: Plugin = async ({ client }: PluginInput, options: PluginOptions = 
               deletedSessions.add(info.id)
               cancelRecovery(info.id, "session deleted")
               states.delete(info.id)
+              seenUserMessageIDs.delete(info.id)
               pendingRequests.delete(info.id)
               pendingWithoutID.delete(info.id)
               pendingUser.delete(info.id)
@@ -281,7 +325,14 @@ const plugin: Plugin = async ({ client }: PluginInput, options: PluginOptions = 
       watch.dispose()
       recovery.dispose()
       notify.dispose()
+      seenUserMessageIDs.clear()
     },
   }
 }
-export default plugin
+const entry: Plugin.Plugin & { server: V1Plugin } = {
+  id: "opencode-turbo",
+  server: plugin,
+  setup: async (context) => (await import("./runtime/v2/server")).v2Setup(context),
+}
+
+export default entry

@@ -16,6 +16,7 @@ function hold<T>() {
 }
 const user = (id: string): MessageLike => ({ info: { id, role: "user" }, parts: [{ type: "text", text: id }] })
 const failed = (id: string): MessageLike => ({ info: { id, role: "assistant", error: { name: "APIError", data: { message: "provider failure", statusCode: 503 } }, providerID: "p", modelID: "m" }, parts: [] })
+const failedWith = (id: string, message: string): MessageLike => ({ info: { id, role: "assistant", error: { name: "APIError", data: { message, statusCode: 503 } }, providerID: "p", modelID: "m" }, parts: [] })
 const empty = (id: string): MessageLike => ({ info: { id, role: "assistant", finish: "stop", providerID: "p", modelID: "m" }, parts: [] })
 const tick = () => new Promise((resolve) => setTimeout(resolve, 0))
 
@@ -31,12 +32,18 @@ function harness(options: {
   const states = new Map<string, SessionState>()
   const prompts: Array<{ parts: Array<{ type: string; text?: string }> }> = []
   const getState = (id: string) => { let state = states.get(id); if (!state) { state = createState(); states.set(id, state) }; return state }
-  const client = { session: {
-    messages: async () => options.messages ? options.messages() : ({ data: [user("u"), failed("a")] }),
-    status: async ({ signal }: { signal?: AbortSignal } = {}) => options.status ? options.status(signal) : ({ data: { s: { type: "idle" } } }),
-    prompt: async ({ body }: { body: { parts: Array<{ type: string; text?: string }> } }) => { prompts.push(body); return { data: {} } },
-  } } as unknown as PluginInput["client"]
-  const recovery = createRecovery({ client, log: options.log ?? (async () => {}), notify: { onSessionStatusRetry() {}, onRecoveryStart() {}, onRecoveryStopped() {}, dispose() {} }, getState, isBlocked: options.blocked ?? (() => false), cancelRecovery: options.cancel ?? ((id) => { const state = getState(id); state.recoveryCancelled = true; state.recoveryGeneration++ }), states, probeTimeoutMs: options.probeTimeoutMs, sleep: options.wait })
+  const runtime = {
+    messages: async () => {
+      const result = options.messages ? await options.messages() as { data?: MessageLike[] } : undefined
+      return result?.data ?? [user("u"), failed("a")]
+    },
+    status: async (_id: string, signal?: AbortSignal) => {
+      const result = options.status ? await options.status(signal) as { data?: Record<string, { type?: string }> } : undefined
+      return result?.data?.s?.type ?? "idle"
+    },
+    prompt: async ({ parts }: { parts: Array<{ type: string; text?: string }> }) => { prompts.push({ parts }); },
+  }
+  const recovery = createRecovery({ runtime, log: options.log ?? (async () => {}), notify: { onSessionStatusRetry() {}, onRecoveryStart() {}, onRecoveryStopped() {}, dispose() {} }, getState, isBlocked: options.blocked ?? (() => false), cancelRecovery: options.cancel ?? ((id) => { const state = getState(id); state.recoveryCancelled = true; state.recoveryGeneration++ }), states, probeTimeoutMs: options.probeTimeoutMs, sleep: options.wait })
   return { recovery, states, getState, prompts }
 }
 
@@ -211,7 +218,8 @@ console.log("ok: recovery race regressions")
   const previousHome = process.env.HOME
   process.env.HOME = home
   try {
-    const { default: plugin } = await import("./index.ts")
+    const { default: entry } = await import("./index.ts")
+    const plugin = entry.server
     const gate = hold<unknown>(); let reads = 0; const prompts: unknown[] = []
     const client = { session: {
       messages: async () => ++reads <= 2 ? gate.promise : ({ data: [user("u"), empty("a")] }),
@@ -275,6 +283,46 @@ console.log("ok: recovery race regressions")
       await new Promise((resolve) => setTimeout(resolve, 1_550))
       check(promptArgs.length === 2 && toasts.filter((message) => message === "attempt 1/10").length === 2, "staggered stale empty snapshot does not duplicate completed recovery; later error starts at 1/10")
       await raceHooks.dispose?.()
+    }
+    {
+      const pendingRead = hold<unknown>(); const readStarted = hold<void>(); let reads = 0; let promptCount = 0
+      const metadataClient = { ...client, session: {
+        ...client.session,
+        messages: async () => { if (++reads === 1) { readStarted.resolve(); return pendingRead.promise }; return { data: [user("u2"), empty("a")] } },
+        prompt: async () => { promptCount++; return { data: {} } },
+      } } as unknown as PluginInput["client"]
+      const metadataHooks = await plugin({ client: metadataClient } as PluginInput, { stallTimeoutMs: 0 })
+      const userEvent = { type: "message.updated", properties: { info: { id: "u2", sessionID: "s", role: "user" } } }
+      await metadataHooks.event!({ event: userEvent as never })
+      const pendingEmpty = metadataHooks.event!({ event } as never)
+      await readStarted.promise
+      await metadataHooks.event!({ event: userEvent as never })
+      pendingRead.resolve({ data: [user("u2"), empty("a")] }); await pendingEmpty
+      for (let i = 0; i < 30 && !promptCount; i++) await tick()
+      check(promptCount === 1, "repeated V1 user metadata does not invalidate pending empty-output recovery")
+      await metadataHooks.dispose?.()
+    }
+    {
+      let messages: MessageLike[] = [user("u"), failedWith("a", "first failure")]
+      const prompts: unknown[] = []; const toasts: string[] = []
+      const retryClient = { ...client, tui: { showToast: async ({ body }: { body: { message: string } }) => { toasts.push(body.message); return {} } }, session: {
+        ...client.session,
+        messages: async () => ({ data: messages }),
+        prompt: async (args: unknown) => { prompts.push(args); return { data: {} } },
+      } } as unknown as PluginInput["client"]
+      const retryHooks = await plugin({ client: retryClient } as PluginInput, { stallTimeoutMs: 0 })
+      const sameUser = { type: "message.updated", properties: { info: { id: "u", sessionID: "s", role: "user" } } }
+      await retryHooks.event!({ event: sameUser as never })
+      const errorEvent = (error: string) => ({ type: "session.error", properties: { sessionID: "s", error: { name: "APIError", data: { message: error, statusCode: 503 } } } })
+      await retryHooks.event!({ event: errorEvent("first failure") as never })
+      await new Promise((resolve) => setTimeout(resolve, 650))
+      check(prompts.length === 1, "initial failure starts recovery attempt one")
+      await retryHooks.event!({ event: sameUser as never })
+      messages = [user("u"), failedWith("b", "second failure")]
+      await retryHooks.event!({ event: errorEvent("second failure") as never })
+      await new Promise((resolve) => setTimeout(resolve, 3_000))
+      check(prompts.length === 2 && toasts.includes("attempt 2/10"), "same user ID after a recovery failure does not reset attempts")
+      await retryHooks.dispose?.()
     }
   } finally {
     if (previousHome === undefined) delete process.env.HOME

@@ -107,6 +107,12 @@ session state.
 
 ## Install
 
+Supports OpenCode V1 **>=1.19.0** and the V2 **2.0.27** API. The same package provides server recovery and the TUI status line for both versions.
+
+For V2, use `"plugins": ["@alexsun-top/opencode-turbo"]`. To pass options, use `"plugins": [{ "package": "@alexsun-top/opencode-turbo", "options": { "stallTimeoutMs": 1800000, "emptyOutput": true } }]`. V2 server notifications reach the CLI through the plugin's public RPC events; recovery also works without a CLI.
+
+For V1, use the configuration below:
+
 ```json
 {
   "plugin": ["@alexsun-top/opencode-turbo"]
