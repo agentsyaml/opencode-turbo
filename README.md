@@ -107,32 +107,60 @@ session state.
 
 ## Install
 
-Supports OpenCode V1 **>=1.19.0** and the V2 **2.0.27** API. The same package provides server recovery and the TUI status line for both versions.
+Supports OpenCode V1 **>=1.19.0** and the OpenCode V2 **2.0.27** API. The same package provides server recovery and the TUI status line; the server plugin automatically supplies its TUI companion.
 
-For V2, use `"plugins": ["@alexsun-top/opencode-turbo"]`. To pass options, use `"plugins": [{ "package": "@alexsun-top/opencode-turbo", "options": { "stallTimeoutMs": 1800000, "emptyOutput": true } }]`. V2 server notifications reach the CLI through the plugin's public RPC events; recovery also works without a CLI.
+### OpenCode V2 (recommended)
 
-For V1, use the configuration below:
+Install the pinned release for the current CLI user:
+
+```sh
+opencode plugin add @alexsun-top/opencode-turbo@0.2.1
+opencode plugin list
+```
+
+This is a user-level install; do not use `npm -g`. The plugin includes server recovery and registers its TUI status line automatically. Do not add this package separately to `cli.json` for a normal install: that file is for terminal-client settings and CLI-only plugins, while this package is a server plugin. Notifications use the public plugin RPC; headless recovery works without an open CLI.
+
+Alternatively, add it to the global server config at `~/.config/opencode/opencode.json` or `opencode.jsonc`:
 
 ```json
 {
-  "plugin": ["@alexsun-top/opencode-turbo"]
+  "plugins": ["@alexsun-top/opencode-turbo@0.2.1"]
 }
 ```
 
-Local development — point at the source:
+To set options, use the package object form:
 
 ```json
 {
-  "plugin": ["file:///path/to/opencode-turbo"]
+  "plugins": [{
+    "package": "@alexsun-top/opencode-turbo@0.2.1",
+    "options": { "stallTimeoutMs": 1800000, "emptyOutput": true }
+  }]
 }
 ```
 
-Optional configuration — pass options as the second plugin tuple element:
+OpenCode watches server configuration, so a server restart is generally unnecessary. If the status line does not appear in an already-open terminal client, reopen that CLI.
+
+V2 terminal-client settings are read from the global `~/.config/opencode/cli.json`. This replaces the V1 `tui.json` / `tui.jsonc` location; migration happens only when `cli.json` does not exist, and old files are left in place. Do not create a project-local `cli.json`.
+
+See the [V2 plugin guide](https://opencode.ai/v2/docs/plugins), [V2 configuration reference](https://opencode.ai/v2/docs/config), and [V1 terminal-config migration notes](https://opencode.ai/v2/docs/migrate-v1#terminal-client-configuration).
+
+### OpenCode V1 (>=1.19.0)
+
+V1 uses the singular `plugin` key and tuple syntax for options:
+
+```json
+{
+  "plugin": ["@alexsun-top/opencode-turbo@0.2.1"]
+}
+```
+
+V1 options are the second tuple element:
 
 ```json
 {
   "plugin": [
-    ["@alexsun-top/opencode-turbo", { "stallTimeoutMs": 1800000, "emptyOutput": true }]
+    ["@alexsun-top/opencode-turbo@0.2.1", { "stallTimeoutMs": 1800000, "emptyOutput": true }]
   ]
 }
 ```
@@ -141,10 +169,26 @@ Optional configuration — pass options as the second plugin tuple element:
   watchdog treats a session as stalled; `0` disables the watchdog.
 - `emptyOutput` (default `true`): recover a turn that finished with no output.
 
-Restart OpenCode after changing config.
+The same options can be placed in the V2 package object shown above.
 
-> The TUI status line is served from `dist/tui.js`. After editing `src/tui.tsx`,
-> run `bun run build:tui` — otherwise the sidebar line silently won't load.
+### Local development
+
+Point both versions at the package directory; V2 uses `plugins` (plural), while V1 uses `plugin` (singular). V2 resolves the shared server and TUI exports from the package directory, so do not point directly at `src/index.ts`.
+
+```json
+{
+  "plugins": ["file:///path/to/opencode-turbo"]
+}
+```
+
+```json
+{
+  "plugin": ["file:///path/to/opencode-turbo"]
+}
+```
+
+> The TUI status line is served from the built TUI entry. After editing a TUI
+> TSX file, run `bun run build:tui` before testing or publishing.
 
 ## Development
 

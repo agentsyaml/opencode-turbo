@@ -1,10 +1,40 @@
-import { panelRow, runningToolOf } from "./tui"
+import { panelRow, runningToolOf, textTokensOf, thinkingTokensOf } from "./tui"
 import { spawnSync } from "node:child_process"
-import { completedV2Outcome, failedV2Outcome, matchesToastLocation, normalizeV2Parts, parseTurboToast, settledV2Row, v2PartsOf, v2Pending, v2TuiSetup } from "./tui-v2"
+import { completedV2Outcome, failedV2Outcome, isV2Abort, matchesToastLocation, normalizeV2Parts, parseTurboToast, settledV2Row, v2Done, v2PartsOf, v2Pending, v2Turn, v2TuiSetup } from "./tui-v2"
 
 const assert = (condition: unknown, message: string) => {
   if (!condition) throw new Error(`FAIL: ${message}`)
 }
+
+// V2 emits one assistant message per model step. The panel must aggregate the
+// whole turn, otherwise token counts reset on every step and Done reports only
+// the final step's duration.
+const step = (id: string, created: number, content: unknown[], extra: object = {}) => ({
+  id, type: "assistant", agent: "a", model: { id: "m", providerID: "p" }, content, time: { created }, ...extra,
+})
+const reasoningPart = (text: string, created: number, completed?: number) => ({ type: "reasoning", text, time: { created, ...(completed === undefined ? {} : { completed }) } })
+const turnMessages = [
+  { id: "u", type: "user", text: "go", time: { created: 1_000 } },
+  step("s1", 1_100, [reasoningPart("a".repeat(400), 1_200, 1_900), { type: "tool", id: "c1", name: "shell", time: { created: 1_950, ran: 2_000 }, state: { status: "completed", input: { command: "ls" } } }], { finish: "tool-calls", time: { created: 1_100, completed: 2_100 } }),
+  step("s2", 500_000, [{ type: "text", text: "b".repeat(800) }], { finish: "stop", time: { created: 500_000, completed: 503_000 } }),
+  { id: "i", type: "idle", outcome: "succeeded", time: { created: 503_100 } },
+] as never[]
+const turn = v2Turn(turnMessages)
+assert(turn.parts.length === 3, "turn aggregates content from every step")
+assert(turn.start === 1_100 && turn.last?.id === "s2" && turn.outcome === "succeeded" && turn.live === undefined, "turn exposes start, last step and outcome")
+// Counters and the Done duration must span every step of the turn.
+assert(thinkingTokensOf(turn.parts) === 100, "thinking tokens accumulate across steps")
+assert(textTokensOf(turn.parts) === 200, "text tokens accumulate across steps")
+assert(turn.last?.time.completed! - turn.start! === 501_900, "Done measures the whole turn, not the last step")
+assert(v2Done(turn)?.ms === 501_900, "v2Done spans the whole turn")
+assert(v2Done({ ...turn, outcome: "interrupted" }) === undefined, "an aborted turn reports no Done")
+assert(turn.live === undefined, "finished turn has no live step")
+const afterPreviousTurn = v2Turn([...turnMessages, { id: "u2", type: "user", text: "next", time: { created: 600_000 } }] as never[])
+assert(afterPreviousTurn.parts.length === 0 && afterPreviousTurn.outcome === undefined, "a new user message starts a fresh turn")
+const liveTurn = v2Turn([{ id: "u", type: "user", text: "go", time: { created: 1 } }, step("s1", 2, [], { time: { created: 2, completed: 9 } }), step("s2", 10, [reasoningPart("live", 11)])] as never[])
+assert(liveTurn.live?.id === "s2" && liveTurn.live?.content.length === 1, "live step is the one still streaming")
+assert(isV2Abort({ type: "aborted", message: "Step interrupted" }), "V2 aborted error is a user abort, not a failure")
+assert(!isV2Abort({ type: "provider.internal", message: "Service unavailable" }), "provider error is not a user abort")
 
 const tool = normalizeV2Parts([{
   type: "tool",

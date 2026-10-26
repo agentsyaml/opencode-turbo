@@ -2,7 +2,7 @@ import type { Plugin as V2Plugin } from "@opencode/plugin/tui"
 import { createElement, spread } from "@opentui/solid"
 import { createEffect, createMemo, createSignal, onCleanup } from "solid-js"
 import { isAbortError } from "./matcher"
-import { completionOf, hasPendingUserRequest, panelRow, runningToolOf, textTokensOf, thinkingTokensOf, updateToolTokenCache, type PartLike, type PanelState } from "./tui"
+import { hasPendingUserRequest, panelRow, runningToolOf, textTokensOf, thinkingTokensOf, updateToolTokenCache, type PartLike, type PanelState } from "./tui"
 import { turboRpc } from "./v2-rpc"
 
 type Message = ReturnType<V2Plugin.Context["data"]["session"]["message"]["list"]>[number]
@@ -13,6 +13,49 @@ type LocationIdentity = { directory: string; workspaceID?: string }
 
 export function v2PartsOf(message: Pick<Assistant, "content"> | undefined): Content[] {
   return message?.content ?? []
+}
+
+/** V2 writes one assistant message per model step; V1 kept a whole turn in one message. */
+export type V2Turn = {
+  /** First assistant step of the turn: the V1 equivalent of the assistant message start. */
+  start?: number
+  parts: PartLike[]
+  live?: Assistant
+  last?: Assistant
+  outcome?: Idle["outcome"]
+  idleAt?: number
+}
+
+export function v2Turn(messages: readonly Message[]): V2Turn {
+  const ordered = [...messages].sort((a, b) => (a.time?.created ?? 0) - (b.time?.created ?? 0))
+  let lastUser = -1
+  for (let index = ordered.length - 1; index >= 0; index--) if (ordered[index].type === "user") { lastUser = index; break }
+  const turn = lastUser < 0 ? ordered : ordered.slice(lastUser)
+  const assistants = turn.filter((message): message is Assistant => message.type === "assistant")
+  let live: Assistant | undefined
+  for (let index = assistants.length - 1; index >= 0; index--) if (!assistants[index].time.completed) { live = assistants[index]; break }
+  let idle: Idle | undefined
+  for (let index = turn.length - 1; index >= 0; index--) if (turn[index].type === "idle") { idle = turn[index] as Idle; break }
+  return {
+    start: assistants[0]?.time?.created,
+    parts: normalizeV2Parts(assistants.flatMap((message) => message.content)),
+    live,
+    last: assistants.at(-1),
+    outcome: idle?.outcome,
+    idleAt: idle?.time?.created,
+  }
+}
+
+export function v2Done(turn: V2Turn): { ms: number; at: string } | undefined {
+  const ended = turn.last?.time.completed ?? turn.idleAt
+  if (turn.live || !turn.start || ended === undefined || !completedV2Outcome(turn.outcome)) return undefined
+  return { ms: ended - turn.start, at: new Date(ended).toLocaleTimeString() }
+}
+
+/** V2 abort errors carry `{ type: "aborted" }`; V1 named them MessageAbortedError. */
+export function isV2Abort(error: unknown): boolean {
+  if (isAbortError(error)) return true
+  return typeof error === "object" && error !== null && (error as { type?: unknown }).type === "aborted"
 }
 
 export function normalizeV2Parts(parts: Content[]): PartLike[] {
@@ -94,21 +137,18 @@ function StatusLine(props: { context: V2Plugin.Context; sessionID: () => string 
     const { context } = props
     const sessionID = props.sessionID()
     const now = tick()
-    const messages = context.data.session.message.list(sessionID)
-    const ordered = [...messages].sort((a, b) => (b.time?.created ?? 0) - (a.time?.created ?? 0))
-    const newest = ordered[0]
-    const isUser = newest?.type === "user"
-    const assistants = ordered.filter((m): m is Assistant => m.type === "assistant")
-    const assistant = assistants.find((m) => !m.time.completed && !m.error) ?? (isUser ? undefined : assistants[0])
-    const parts = normalizeV2Parts(v2PartsOf(assistant))
+    const turn = v2Turn(context.data.session.message.list(sessionID))
     const permission = context.data.session.permission.list(sessionID)
     const location = context.data.session.get(sessionID)?.location ?? context.location
     const forms = context.data.session.form.list(sessionID, location)
     const pending = v2Pending(permission, forms)
     const status = context.data.session.status(sessionID)
-    const finished = !!assistant && (!!assistant.time?.completed || !!assistant.error)
-    const generating = status === "running"
-    const found = !pending && generating ? runningToolOf(parts) : undefined
+    // The cached status can lag after a reload; a step that is still streaming
+    // is stronger evidence than a stale "idle", as in V1's message fallback.
+    const generating = status === "running" || (turn.live !== undefined && turn.outcome === undefined)
+    // Search the whole turn, like V1's single assistant message: tools from an
+    // earlier step stay in the turn, so the live step alone is not the whole story.
+    const found = !pending && generating ? runningToolOf(turn.parts) : undefined
     let tool: PanelState["tool"]
     if (found) {
       let anchor = anchors.get(found.callID)
@@ -116,21 +156,22 @@ function StatusLine(props: { context: V2Plugin.Context; sessionID: () => string 
       updateToolTokenCache(anchor, found.tool, found.input)
       tool = { name: found.name, elapsed: now - (found.start ?? anchor.start), tokens: anchor.tokens, tokenLabel: anchor.tokenLabel, timeout: found.timeout }
     }
-    const reasoning = parts.some((p) => p.type === "reasoning" && p.time?.completed === undefined)
-    const thinking = !pending && generating && !finished && reasoning ? thinkingTokensOf(parts) : 0
-    const start = parts.find((p) => p.type === "reasoning")?.time?.created ?? assistant?.time?.created
-    const hasOutput = parts.some((p) => (p.type === "reasoning" || p.type === "text") ? !!p.text?.trim() : p.type === "tool")
+    // Reasoning streams one step at a time; count the whole turn like V1 so the
+    // number grows with the response instead of resetting on every step.
+    const reasoning = turn.parts.some((p) => p.type === "reasoning" && p.time?.completed === undefined)
+    const thinking = !pending && generating && reasoning ? thinkingTokensOf(turn.parts) : 0
+    const start = turn.parts.find((p) => p.type === "reasoning")?.time?.created ?? turn.start
+    const hasOutput = turn.parts.some((p) => (p.type === "reasoning" || p.type === "text") ? !!p.text?.trim() : p.type === "tool")
     const waiting = pending || (generating && !hasOutput)
     const working = !pending && generating && !tool && thinking === 0 && !waiting
     if (working && !workStart) workStart = now
     if (!working) workStart = 0
     if (waiting && !waitStart) waitStart = now
     if (!waiting) waitStart = 0
-    const outcome = newest?.type === "idle" ? newest.outcome : undefined
-    const failed = failedV2Outcome(outcome)
-    const done = !pending && status === "idle" && completedV2Outcome(outcome) && finished && !isUser ? completionOf(assistant) : undefined
-    const terminalFailure = failed || (!!assistant?.error && !isAbortError(assistant.error))
-    return { tool, thinking, thinkingElapsed: start ? now - start : undefined, waiting, waitElapsed: waitStart ? now - waitStart : undefined, working, workElapsed: working ? now - workStart : undefined, workingSpin: Math.floor(now / 100) % 10, textTokens: working ? textTokensOf(parts) : 0, done, failed: !pending && status === "idle" && !isUser && terminalFailure }
+    const ended = v2Done(turn)
+    const done = !pending && status === "idle" ? ended : undefined
+    const terminalFailure = failedV2Outcome(turn.outcome) || (!!turn.last?.error && !isV2Abort(turn.last.error))
+    return { tool, thinking, thinkingElapsed: start ? now - start : undefined, waiting, waitElapsed: waitStart ? now - waitStart : undefined, working, workElapsed: working ? now - workStart : undefined, workingSpin: Math.floor(now / 100) % 10, textTokens: working ? textTokensOf(turn.parts) : 0, done, failed: !pending && status === "idle" && terminalFailure }
   }
   const line = createMemo(() => {
     try { return settledV2Row(compute(), tick(), settle) } catch { return "🤖 idle" }

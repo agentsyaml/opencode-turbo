@@ -82,17 +82,77 @@ TLS/证书错误只有精确的 Bun 错误码并搭配精确的
 
 ## 安装
 
+支持 OpenCode V1 **>=1.19.0**，以及按 OpenCode V2 **2.0.27** API 适配的版本。同一个包提供服务端恢复与 TUI 状态行；服务端插件会自动注册对应的 TUI 扩展。
+
+### OpenCode V2（推荐）
+
+为当前 CLI 用户安装固定版本：
+
+```sh
+opencode plugin add @alexsun-top/opencode-turbo@0.2.1
+opencode plugin list
+```
+
+这是用户级安装，不要使用 `npm -g`。插件同时提供服务端恢复和侧栏状态行，普通安装无需再把本包单独添加到 `cli.json`：该文件用于终端客户端设置和仅扩展终端界面的插件，而本包是服务端插件。通知通过公开 RPC 事件发送；没有打开 CLI 时服务端恢复仍可工作。
+
+也可以将插件添加到全局服务端配置 `~/.config/opencode/opencode.json` 或 `opencode.jsonc`：
+
 ```json
 {
-  "plugin": ["@alexsun-top/opencode-turbo"]
+  "plugins": ["@alexsun-top/opencode-turbo@0.2.1"]
 }
 ```
 
-支持 OpenCode V1 **>=1.19.0**，V2 按 **2.0.27** API 适配；同一包提供两版服务端恢复及 TUI 状态行。
+需要设置选项时使用包对象写法：
 
-V2 使用 `"plugins": ["@alexsun-top/opencode-turbo"]`；传参使用 `"plugins": [{ "package": "@alexsun-top/opencode-turbo", "options": { "stallTimeoutMs": 1800000, "emptyOutput": true } }]`。V2 通知通过插件公开 RPC 事件传给 CLI，无 CLI 时服务端仍可恢复。本文其他 `plugin` 单数配置示例用于 V1。
+```json
+{
+  "plugins": [{
+    "package": "@alexsun-top/opencode-turbo@0.2.1",
+    "options": { "stallTimeoutMs": 1800000, "emptyOutput": true }
+  }]
+}
+```
 
-本地开发可直接指向源码：
+OpenCode 通常会监视服务端配置并自动重载，无需重启服务端。如果已打开的终端 CLI 没有显示状态行，只需重新打开 CLI。
+
+V2 终端客户端设置使用全局 `~/.config/opencode/cli.json`，取代 V1 的 `tui.json` / `tui.jsonc` 位置；仅当 `cli.json` 不存在时才会迁移，旧文件会保留。不要创建项目本地的 `cli.json`。
+
+参考：[V2 插件指南](https://opencode.ai/v2/docs/plugins)、[V2 配置说明](https://opencode.ai/v2/docs/config)和[V1 终端配置迁移说明](https://opencode.ai/v2/docs/migrate-v1#terminal-client-configuration)。
+
+### OpenCode V1（>=1.19.0）
+
+V1 使用单数 `plugin` 配置键；传选项时使用二元组：
+
+```json
+{
+  "plugin": ["@alexsun-top/opencode-turbo@0.2.1"]
+}
+```
+
+V1 选项作为二元组第二项传入：
+
+```json
+{
+  "plugin": [
+    ["@alexsun-top/opencode-turbo@0.2.1", { "stallTimeoutMs": 1800000, "emptyOutput": true }]
+  ]
+}
+```
+
+- `stallTimeoutMs`（默认 `1800000`，即 30 分钟）：判定为卡顿前的静默时长；
+  `0` 关闭看门狗。
+- `emptyOutput`（默认 `true`）：恢复没有输出的回合。V2 可在上方包对象的 `options` 中使用相同设置。
+
+### 本地开发
+
+V1 和 V2 都指向包目录；V2 使用复数键 `plugins`，V1 使用单数键 `plugin`。V2 会从包目录同时解析共享的服务端与 TUI 导出，不要直接指向 `src/index.ts`：
+
+```json
+{
+  "plugins": ["file:///path/to/opencode-turbo"]
+}
+```
 
 ```json
 {
@@ -100,24 +160,8 @@ V2 使用 `"plugins": ["@alexsun-top/opencode-turbo"]`；传参使用 `"plugins"
 }
 ```
 
-可选配置——以插件二元组的第二项传入：
-
-```json
-{
-  "plugin": [
-    ["@alexsun-top/opencode-turbo", { "stallTimeoutMs": 1800000, "emptyOutput": true }]
-  ]
-}
-```
-
-- `stallTimeoutMs`（默认 `1800000`，即 30 分钟）：判定为卡顿前的静默时长；
-  `0` 关闭看门狗。
-- `emptyOutput`（默认 `true`）：恢复没有输出的回合。
-
-修改配置后重启 OpenCode。
-
-> TUI 状态行由 `dist/tui.js` 提供。修改 `src/tui.tsx` 后需执行
-> `bun run build:tui`，否则侧边栏状态行不会加载。
+> TUI 状态行由构建后的 TUI 入口提供。修改 TUI TSX 文件后，测试或发布前需执行
+> `bun run build:tui`。
 
 ## 开发
 
